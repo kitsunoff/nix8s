@@ -69,8 +69,15 @@ in
   flake.nixosConfigurations = installerConfigs;
 
   # Add PXE server packages
-  perSystem = { pkgs, ... }:
+  perSystem = { pkgs, system, ... }:
     let
+      # Download prebuilt iPXE binaries (works on all platforms)
+      ipxeFiles = pkgs.fetchzip {
+        url = "https://boot.ipxe.org/ipxe.tar.gz";
+        hash = "sha256-lp0T3X3qXp3zyMBgmL8fiqPvqZnvSj3CrhAq8LjsqvA=";
+        stripRoot = false;
+      };
+
       # Build netboot assets for a cluster
       mkPxeAssets = clusterName: cluster:
         let
@@ -165,7 +172,7 @@ in
         in
         pkgs.writeShellApplication {
           name = "${clusterName}-pxe-server";
-          runtimeInputs = with pkgs; [ dnsmasq python3 ipxe ];
+          runtimeInputs = with pkgs; [ dnsmasq python3 ];
           text = ''
             set -euo pipefail
 
@@ -180,10 +187,14 @@ in
 
             # Setup TFTP root
             mkdir -p "$TFTP_ROOT"
-            cp ${pkgs.ipxe}/undionly.kpxe "$TFTP_ROOT/"
+            cp ${ipxeFiles}/undionly.kpxe "$TFTP_ROOT/"
 
-            # Get server IP
-            SERVER_IP=$(ip -4 addr show "$INTERFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+            # Get server IP (cross-platform: Linux and macOS)
+            if command -v ip &> /dev/null; then
+              SERVER_IP=$(ip -4 addr show "$INTERFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+            else
+              SERVER_IP=$(ifconfig "$INTERFACE" | grep 'inet ' | awk '{print $2}')
+            fi
             echo "Server IP: $SERVER_IP"
             echo ""
 
