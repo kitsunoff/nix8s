@@ -64,17 +64,17 @@ in
   # Hostname for installer (override base.nix)
   networking.hostName = lib.mkForce "${nodeName}-installer";
 
-  # Enable SSH for debugging
+  # Enable SSH for debugging (override base.nix settings)
   services.openssh = {
     enable = true;
     settings = {
-      PermitRootLogin = "yes";
-      PermitEmptyPasswords = "yes";
+      PermitRootLogin = lib.mkForce "yes";
+      PermitEmptyPasswords = lib.mkForce "yes";
     };
   };
 
   # Empty root password for emergency access
-  users.users.root.initialHashedPassword = "";
+  users.users.root.initialHashedPassword = lib.mkForce "";
 
   # Auto-start installation
   systemd.services.nix8s-installer = {
