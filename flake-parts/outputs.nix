@@ -3,7 +3,9 @@
 
 let
   cfg = config.nix8s;
-  nixosModules = (inputs.import-tree.withLib lib).leafs ../modules/nixos;
+
+  # NixOS modules path (relative to this file)
+  nix8sModulesPath = ../modules/nixos;
 
   # Member-specific attrs (not merged into node config)
   memberAttrs = [ "node" "role" "ip" ];
@@ -33,16 +35,13 @@ let
   # Generate a single nixosConfiguration
   mkNixosConfig = { clusterName, cluster, memberName, member }:
     let
-      # Validate secrets first
       validatedCluster = validateSecrets clusterName cluster;
       nodeConfig = buildNodeConfig clusterName memberName member;
       nodeName = "${clusterName}-${memberName}";
 
-      # Determine if this is the first server
       isFirstServer =
         member.role == "server" &&
         memberName == (cluster.ha.firstServer or
-          # If no firstServer specified, find first server alphabetically
           (lib.head (lib.sort (a: b: a < b)
             (lib.attrNames (lib.filterAttrs (_: m: m.role == "server") cluster.members)))));
     in
@@ -60,10 +59,12 @@ let
         # Disko module
         inputs.disko.nixosModules.disko
 
-        # Base system modules (auto-discovered by import-tree)
-      ] ++ nixosModules
-      # User modules from node template
-      ++ (nodeConfig.nixosModules or [ ])
+        # Base nix8s NixOS modules
+        (nix8sModulesPath + "/base.nix")
+        (nix8sModulesPath + "/k3s.nix")
+
+        # User modules from node template
+      ] ++ (nodeConfig.nixosModules or [ ])
       # Extension modules (from nixosModulesFor)
       ++ (cfg.nixosModulesFor.${nodeName} or [ ]);
     };
