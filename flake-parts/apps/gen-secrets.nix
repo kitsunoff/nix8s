@@ -8,7 +8,7 @@ in
   perSystem = { pkgs, ... }:
     let
       genToken = ''
-        head --bytes=32 /dev/urandom | base64 | tr --delete '/+=' | head --characters=48
+        head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 48
       '';
 
       genSecretsScript = pkgs.writeShellApplication {
@@ -40,7 +40,7 @@ in
           esac
 
           SECRETS_DIR="nix8s/secrets"
-          mkdir --parents "$SECRETS_DIR"
+          mkdir -p "$SECRETS_DIR"
 
           SECRETS_FILE="$SECRETS_DIR/$CLUSTER_NAME.nix"
 
@@ -60,7 +60,7 @@ in
 
           cat > "$SECRETS_FILE" << EOF
           # Secrets for cluster: $CLUSTER_NAME
-          # Generated: $(date --iso-8601=seconds)
+          # Generated: $(date -Iseconds)
           #
           # IMPORTANT: Encrypt this file before committing!
           #   sops --encrypt --in-place $SECRETS_FILE
@@ -90,7 +90,7 @@ in
           set -euo pipefail
 
           SECRETS_DIR="nix8s/secrets"
-          mkdir --parents "$SECRETS_DIR"
+          mkdir -p "$SECRETS_DIR"
 
           cat > "$SECRETS_DIR/.gitignore" << 'EOF'
           # SECURITY: Ignore ALL by default — only encrypted files allowed
