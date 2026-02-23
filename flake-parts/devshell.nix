@@ -1,5 +1,5 @@
 # Development shell
-{ ... }:
+{ lib, ... }:
 
 {
   perSystem = { pkgs, ... }: {
@@ -12,7 +12,7 @@
         yq-go
         sops
         age
-      ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+      ] ++ lib.optionals pkgs.stdenv.isLinux [
         k3s
       ];
     };

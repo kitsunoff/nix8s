@@ -2,6 +2,21 @@
 
 Declarative k3s cluster provisioned with [nix8s](https://github.com/kitsunoff/nix8s).
 
+## Structure
+
+```
+.
+├── flake.nix
+├── nix8s/                    # Auto-imported via import-tree
+│   ├── nodes/               # Node templates
+│   │   └── standard.nix
+│   ├── clusters/            # Cluster definitions
+│   │   └── dev.nix
+│   └── provisioning.nix     # Provisioning config
+└── secrets/                  # Encrypted secrets
+    └── dev.nix
+```
+
 ## Quick Start
 
 1. **Generate secrets:**
@@ -15,36 +30,13 @@ Declarative k3s cluster provisioned with [nix8s](https://github.com/kitsunoff/ni
    git add --force secrets/dev.nix
    ```
 
-3. **Provision nodes:**
+3. **Show available outputs:**
    ```bash
-   # Single node
-   nix run .#nixos-anywhere-dev-server
-
-   # All nodes
-   nix run .#nixos-anywhere-dev-all
+   nix flake show
    ```
 
-## Configuration
+## Adding a New Cluster
 
-Edit `flake.nix` to configure:
-
-- **nodes** — hardware templates (disk, network, extensions)
-- **clusters** — k3s clusters with members
-- **provisioning** — deployment method (nixos-anywhere, pxe, lima)
-
-## Commands
-
-```bash
-# Show available outputs
-nix flake show
-
-# Enter dev shell
-nix develop
-
-# Rebuild nodes
-nix run .#rebuild-dev-server
-nix run .#rebuild-dev-all
-
-# Get kubeconfig
-nix run .#kubeconfig-dev > ~/.kube/config
-```
+1. Create `nix8s/clusters/<name>.nix`
+2. Generate secrets: `nix run .#gen-secrets -- <name>`
+3. Encrypt and commit secrets

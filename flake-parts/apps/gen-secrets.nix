@@ -7,12 +7,10 @@ in
 {
   perSystem = { pkgs, ... }:
     let
-      # Generate random token (base64, 32 bytes)
       genToken = ''
         head --bytes=32 /dev/urandom | base64 | tr --delete '/+=' | head --characters=48
       '';
 
-      # Script to generate secrets for a cluster
       genSecretsScript = pkgs.writeShellApplication {
         name = "gen-secrets";
         runtimeInputs = with pkgs; [ coreutils ];
@@ -29,7 +27,6 @@ in
             exit 1
           fi
 
-          # Validate cluster exists
           case "$CLUSTER_NAME" in
             ${lib.concatMapStringsSep "|" (n: ''"${n}"'') (lib.attrNames cfg.clusters)})
               ;;
@@ -92,7 +89,6 @@ in
         '';
       };
 
-      # Create secrets directory with .gitignore and README
       initSecretsScript = pkgs.writeShellApplication {
         name = "init-secrets";
         runtimeInputs = with pkgs; [ coreutils ];
@@ -102,7 +98,6 @@ in
           SECRETS_DIR="secrets"
           mkdir --parents "$SECRETS_DIR"
 
-          # Create .gitignore (security: block all by default)
           cat > "$SECRETS_DIR/.gitignore" << 'EOF'
           # SECURITY: Ignore ALL by default — only encrypted files allowed
           *
@@ -114,7 +109,6 @@ in
           #   git add --force secrets/<cluster>.nix
           EOF
 
-          # Create README
           cat > "$SECRETS_DIR/README.md" << 'EOF'
           # Secrets Directory
 

@@ -3,14 +3,10 @@
 
 let
   cfg = config.nix8s;
-
-  # NixOS modules path (relative to this file)
   nix8sModulesPath = ../modules/nixos;
 
-  # Member-specific attrs (not merged into node config)
   memberAttrs = [ "node" "role" "ip" ];
 
-  # Resolve node reference (string or attrset)
   resolveNode = clusterName: memberName: nodeRef:
     if builtins.isAttrs nodeRef
     then nodeRef
@@ -18,7 +14,6 @@ let
       cfg.nodes.${nodeRef} or
         (throw "nix8s: clusters.${clusterName}.members.${memberName}.node references '${nodeRef}' which doesn't exist in nix8s.nodes");
 
-  # Build final node config: node template + member overrides
   buildNodeConfig = clusterName: memberName: member:
     let
       baseNode = resolveNode clusterName memberName member.node;
@@ -26,13 +21,11 @@ let
     in
     lib.recursiveUpdate baseNode memberOverrides;
 
-  # Validate cluster secrets
   validateSecrets = clusterName: cluster:
     if (cluster.secrets.token or null) == null
     then throw "nix8s: clusters.${clusterName}.secrets.token is required"
     else cluster;
 
-  # Generate a single nixosConfiguration
   mkNixosConfig = { clusterName, cluster, memberName, member }:
     let
       validatedCluster = validateSecrets clusterName cluster;
@@ -56,20 +49,13 @@ let
         };
       };
       modules = [
-        # Disko module
         inputs.disko.nixosModules.disko
-
-        # Base nix8s NixOS modules
         (nix8sModulesPath + "/base.nix")
         (nix8sModulesPath + "/k3s.nix")
-
-        # User modules from node template
       ] ++ (nodeConfig.nixosModules or [ ])
-      # Extension modules (from nixosModulesFor)
       ++ (cfg.nixosModulesFor.${nodeName} or [ ]);
     };
 
-  # Generate all nixosConfigurations for all clusters
   allConfigs = lib.concatMapAttrs
     (clusterName: cluster:
       lib.mapAttrs'

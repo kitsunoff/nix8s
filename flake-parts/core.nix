@@ -1,6 +1,6 @@
 # Core options for nix8s configuration
 # Defines freeform options: nodes, clusters, provisioning
-{ lib, config, ... }:
+{ lib, ... }:
 
 let
   # Freeform submodule — allows any attribute, but can define specific options.
@@ -133,14 +133,10 @@ in
       description = "Provisioning configuration";
     };
 
-    # Internal: extension modules write here.
     nixosModulesFor = lib.mkOption {
       type = lib.types.attrsOf (lib.types.listOf lib.types.deferredModule);
       default = { };
       description = "NixOS modules contributed by extensions (internal)";
     };
   };
-
-  # Validations are done in outputs.nix where we have access to the final config
-  # and can throw meaningful errors during nixosSystem evaluation
 }

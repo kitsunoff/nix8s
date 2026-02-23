@@ -1,23 +1,24 @@
-# Export nix8s as a flake module for external consumption
-{ lib, inputs, ... }:
+# Export all nix8s flake modules
+{ ... }:
 
 {
-  flake.flakeModules.default = {
-    imports = [
-      ./core.nix
-      ./outputs.nix
-    ];
+  flake.flakeModules = {
+    # All-in-one module
+    default = {
+      imports = [
+        ./core.nix
+        ./outputs.nix
+        ./devshell.nix
+        ./systems.nix
+        ./apps/gen-secrets.nix
+      ];
+    };
 
-    # Pass through inputs needed by outputs.nix
-    config._module.args.inputs = lib.mkDefault inputs;
-  };
-
-  flake.flakeModules.nix8s = {
-    imports = [
-      ./core.nix
-      ./outputs.nix
-    ];
-
-    config._module.args.inputs = lib.mkDefault inputs;
+    # Individual modules
+    core = ./core.nix;
+    outputs = ./outputs.nix;
+    devshell = ./devshell.nix;
+    systems = ./systems.nix;
+    gen-secrets = ./apps/gen-secrets.nix;
   };
 }
