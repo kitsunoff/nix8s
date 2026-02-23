@@ -9,6 +9,24 @@
     # Generate with: nix run .#gen-secrets -- dev
     secrets = builtins.fromJSON (builtins.readFile ../secrets/dev.json);
 
+    # Helm packages (optional)
+    # helmPackages = {
+    #   autoDeployOnBootstrap = true;  # Auto-deploy after k3s starts
+    #   repos = {
+    #     cilium = "https://helm.cilium.io/";
+    #   };
+    #   charts = {
+    #     cilium = {
+    #       chart = "cilium/cilium";
+    #       version = "1.15.0";
+    #       namespace = "kube-system";
+    #       values = {
+    #         operator.replicas = 1;
+    #       };
+    #     };
+    #   };
+    # };
+
     members = {
       server = {
         node = "standard";
