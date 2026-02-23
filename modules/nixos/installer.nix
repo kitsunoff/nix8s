@@ -61,8 +61,8 @@ in
     "${modulesPath}/installer/netboot/netboot-minimal.nix"
   ];
 
-  # Hostname for installer
-  networking.hostName = "${nodeName}-installer";
+  # Hostname for installer (override base.nix)
+  networking.hostName = lib.mkForce "${nodeName}-installer";
 
   # Enable SSH for debugging
   services.openssh = {
