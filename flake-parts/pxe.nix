@@ -99,10 +99,20 @@ in
   perSystem = { pkgs, system, ... }:
     let
       # Download prebuilt iPXE binaries (works on all platforms)
-      ipxeFiles = pkgs.fetchzip {
-        url = "https://boot.ipxe.org/ipxe.tar.gz";
-        hash = "sha256-lp0T3X3qXp3zyMBgmL8fiqPvqZnvSj3CrhAq8LjsqvA=";
-        stripRoot = false;
+      # Legacy BIOS PXE boot
+      ipxeUndionly = pkgs.fetchurl {
+        url = "https://boot.ipxe.org/undionly.kpxe";
+        hash = "sha256-0cP6gBdipRgNChMqExesn7Jvv5M0ae1a8lv/0L9mSq0=";
+      };
+      # UEFI x86_64 boot (full iPXE with all drivers)
+      ipxeEfi = pkgs.fetchurl {
+        url = "https://boot.ipxe.org/x86_64-efi/ipxe.efi";
+        hash = "sha256-1opKhrjay/lVoIshRveu/0pkFq3WgzlI/Tj0HYEqAQ8=";
+      };
+      # UEFI x86_64 boot (SNP only - smaller, uses UEFI network stack)
+      ipxeSnponly = pkgs.fetchurl {
+        url = "https://boot.ipxe.org/x86_64-efi/snponly.efi";
+        hash = "sha256-jrpwZ1CZ5cBUUUy8E2EQvQT6lSxbuso+DV0Wu2R2X1M=";
       };
 
       # Build netboot assets for a cluster
@@ -354,10 +364,18 @@ in
             echo "Interface: $INTERFACE"
             echo "HTTP Port: $HTTP_PORT"
             echo ""
+            echo "Supported boot modes:"
+            echo "  - Legacy BIOS (undionly.kpxe)"
+            echo "  - UEFI x86_64 (ipxe.efi)"
+            echo ""
 
             # Setup directories
             mkdir -p "$TFTP_ROOT" "$DATA_DIR"
-            cp ${ipxeFiles}/undionly.kpxe "$TFTP_ROOT/"
+
+            # Copy iPXE boot files
+            cp ${ipxeUndionly} "$TFTP_ROOT/undionly.kpxe"
+            cp ${ipxeEfi} "$TFTP_ROOT/ipxe.efi"
+            cp ${ipxeSnponly} "$TFTP_ROOT/snponly.efi"
 
             # Get server IP (cross-platform: Linux and macOS)
             if command -v ip &> /dev/null; then
@@ -400,16 +418,24 @@ in
             echo ""
 
             # Run dnsmasq in foreground
+            # Architecture detection via DHCP option 93 (client system architecture)
+            # See RFC 4578 for architecture type values:
+            #   0 = x86 BIOS, 6 = x86 UEFI (32-bit), 7 = x86_64 UEFI, 9 = EBC, 10 = ARM 64-bit UEFI
             dnsmasq \
               --no-daemon \
               --port=0 \
               --interface="$INTERFACE" \
               --bind-interfaces \
               --dhcp-range="$SERVER_IP,proxy" \
-              --dhcp-boot=undionly.kpxe \
               --dhcp-match=set:ipxe,175 \
+              --dhcp-match=set:bios,option:client-arch,0 \
+              --dhcp-match=set:efi64,option:client-arch,7 \
+              --dhcp-match=set:efi64,option:client-arch,9 \
               --dhcp-boot=tag:ipxe,boot.ipxe \
-              --pxe-service=tag:!ipxe,x86PC,"PXE chainload to iPXE",undionly.kpxe \
+              --dhcp-boot=tag:!ipxe,tag:bios,undionly.kpxe \
+              --dhcp-boot=tag:!ipxe,tag:efi64,ipxe.efi \
+              --pxe-service=tag:!ipxe,tag:bios,x86PC,"PXE chainload to iPXE",undionly.kpxe \
+              --pxe-service=tag:!ipxe,tag:efi64,x86-64_EFI,"PXE chainload to iPXE",ipxe.efi \
               --enable-tftp \
               --tftp-root="$TFTP_ROOT" \
               --log-dhcp \
