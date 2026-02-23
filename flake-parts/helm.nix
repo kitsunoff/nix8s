@@ -96,7 +96,7 @@ in
         in
         pkgs.writeShellApplication {
           name = "${clusterName}-helm-deploy";
-          runtimeInputs = with pkgs; [ helm kubectl ];
+          runtimeInputs = with pkgs; [ kubernetes-helm kubectl ];
           text = ''
             set -euo pipefail
 

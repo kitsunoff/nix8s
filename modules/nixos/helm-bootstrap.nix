@@ -80,7 +80,7 @@ let
   bootstrapScript = pkgs.writeShellScript "nix8s-helm-bootstrap" ''
     set -euo pipefail
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-    export PATH="${lib.makeBinPath (with pkgs; [ helm kubectl ])}:$PATH"
+    export PATH="${lib.makeBinPath (with pkgs; [ kubernetes-helm kubectl ])}:$PATH"
 
     FAILED=0
     MARKER_FILE="/var/lib/nix8s/helm-bootstrap-done"
@@ -170,7 +170,7 @@ in
 
     # Required packages
     environment.systemPackages = with pkgs; [
-      helm
+      kubernetes-helm
       kubectl
     ];
   };
