@@ -10,6 +10,8 @@ let
   k3sConfig = cluster.k3s or { };
   haConfig = cluster.ha or { };
   secrets = cluster.secrets;
+  cozystackCfg = cluster.cozystack or {};
+  cozystackEnabled = cozystackCfg.enable or false;
 
   # Server URL for joining
   # If HA with VIP, use VIP; otherwise use first server's IP
@@ -30,6 +32,20 @@ let
   extraServerFlags = k3sConfig.extraArgs.server or [ ];
   extraAgentFlags = k3sConfig.extraArgs.agent or [ ];
 
+  # Cozystack requires specific k3s configuration
+  cozystackFlags = lib.optionals cozystackEnabled [
+    "--disable=traefik"
+    "--disable=servicelb"
+    "--disable=local-storage"
+    "--disable=metrics-server"
+    "--disable-network-policy"
+    "--disable-kube-proxy"
+    "--flannel-backend=none"
+    "--cluster-domain=${cozystackCfg.clusterDomain or "cozy.local"}"
+    "--tls-san=${member.ip}"
+    "--kubelet-arg=max-pods=${toString (cozystackCfg.maxPods or 220)}"
+  ];
+
   # Network configuration flags
   networkFlags =
     let
@@ -46,11 +62,15 @@ let
   serverFlags =
     [ "--node-ip=${member.ip}" ]
     ++ networkFlags
+    ++ cozystackFlags
     ++ extraServerFlags
     ++ lib.optionals isFirstServer [ "--cluster-init" ];
 
   agentFlags =
     [ "--node-ip=${member.ip}" ]
+    ++ (lib.optionals cozystackEnabled [
+      "--kubelet-arg=max-pods=${toString (cozystackCfg.maxPods or 220)}"
+    ])
     ++ extraAgentFlags;
 
 in

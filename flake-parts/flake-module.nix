@@ -12,6 +12,7 @@
         ./helm.nix
         ./manifests.nix
         ./upgrade.nix
+        ./cozystack.nix
         ./devshell.nix
         ./systems.nix
         ./apps/gen-secrets.nix
@@ -25,6 +26,7 @@
     helm = ./helm.nix;
     manifests = ./manifests.nix;
     upgrade = ./upgrade.nix;
+    cozystack = ./cozystack.nix;
     devshell = ./devshell.nix;
     systems = ./systems.nix;
     gen-secrets = ./apps/gen-secrets.nix;
