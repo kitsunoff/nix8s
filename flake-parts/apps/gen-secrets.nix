@@ -39,7 +39,7 @@ in
               ;;
           esac
 
-          SECRETS_DIR="secrets"
+          SECRETS_DIR="nix8s/secrets"
           mkdir --parents "$SECRETS_DIR"
 
           SECRETS_FILE="$SECRETS_DIR/$CLUSTER_NAME.nix"
@@ -78,14 +78,8 @@ in
           echo "  1. Encrypt with sops:"
           echo "     sops --encrypt --in-place $SECRETS_FILE"
           echo ""
-          echo "  2. Verify encryption:"
-          echo "     head -1 $SECRETS_FILE | grep -q sops && echo OK || echo 'NOT ENCRYPTED!'"
-          echo ""
-          echo "  3. Force-add to git:"
+          echo "  2. Force-add to git:"
           echo "     git add --force $SECRETS_FILE"
-          echo ""
-          echo "  4. Use in cluster config:"
-          echo "     clusters.$CLUSTER_NAME.secrets = import ./$SECRETS_FILE;"
         '';
       };
 
@@ -95,7 +89,7 @@ in
         text = ''
           set -euo pipefail
 
-          SECRETS_DIR="secrets"
+          SECRETS_DIR="nix8s/secrets"
           mkdir --parents "$SECRETS_DIR"
 
           cat > "$SECRETS_DIR/.gitignore" << 'EOF'
@@ -103,49 +97,12 @@ in
           *
           !.gitignore
           !.sops.yaml
-          !README.md
 
           # Encrypted files must be force-added:
-          #   git add --force secrets/<cluster>.nix
+          #   git add --force nix8s/secrets/<cluster>.nix
           EOF
 
-          cat > "$SECRETS_DIR/README.md" << 'EOF'
-          # Secrets Directory
-
-          This directory contains encrypted cluster secrets (k3s tokens).
-
-          ## Workflow
-
-          1. Generate secrets:
-             ```bash
-             nix run .#gen-secrets -- <cluster-name>
-             ```
-
-          2. Encrypt with sops:
-             ```bash
-             sops --encrypt --in-place secrets/<cluster>.nix
-             ```
-
-          3. Verify encryption:
-             ```bash
-             head -1 secrets/<cluster>.nix | grep -q sops && echo OK
-             ```
-
-          4. Force-add to git:
-             ```bash
-             git add --force secrets/<cluster>.nix
-             ```
-
-          ## Security
-
-          - `.gitignore` blocks ALL files by default
-          - Only encrypted files should be committed
-          - Never commit plaintext secrets!
-          EOF
-
-          echo "Initialized secrets directory: $SECRETS_DIR/"
-          echo "  - .gitignore (blocks all by default)"
-          echo "  - README.md"
+          echo "Initialized: $SECRETS_DIR/.gitignore"
         '';
       };
     in

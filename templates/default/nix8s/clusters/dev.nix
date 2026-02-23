@@ -7,7 +7,7 @@
     ha.enable = false;
 
     # Generate with: nix run .#gen-secrets -- dev
-    secrets = import ../../secrets/dev.nix;
+    secrets = import ../secrets/dev.nix;
 
     members = {
       server = {
