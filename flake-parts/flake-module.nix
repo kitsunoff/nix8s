@@ -11,6 +11,7 @@
         ./pxe.nix
         ./helm.nix
         ./manifests.nix
+        ./upgrade.nix
         ./devshell.nix
         ./systems.nix
         ./apps/gen-secrets.nix
@@ -23,6 +24,7 @@
     pxe = ./pxe.nix;
     helm = ./helm.nix;
     manifests = ./manifests.nix;
+    upgrade = ./upgrade.nix;
     devshell = ./devshell.nix;
     systems = ./systems.nix;
     gen-secrets = ./apps/gen-secrets.nix;
