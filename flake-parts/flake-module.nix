@@ -8,6 +8,7 @@
       imports = [
         ./core.nix
         ./outputs.nix
+        ./pxe.nix
         ./devshell.nix
         ./systems.nix
         ./apps/gen-secrets.nix
@@ -17,6 +18,7 @@
     # Individual modules
     core = ./core.nix;
     outputs = ./outputs.nix;
+    pxe = ./pxe.nix;
     devshell = ./devshell.nix;
     systems = ./systems.nix;
     gen-secrets = ./apps/gen-secrets.nix;
