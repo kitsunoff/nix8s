@@ -7,5 +7,6 @@
       user = "root";
       keyFile = "~/.ssh/id_ed25519";
     };
+    pxe.enable = true;
   };
 }
