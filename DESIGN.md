@@ -1,434 +1,1441 @@
-# NixOS Cozystack Bootstrap Module
+# nix8s
 
-## Design Document v0.1
+## Design Document v0.6
 
-**Author:** Maksim  
-**Date:** January 2026  
+**Author:** Maksim
+**Date:** February 2026
 **Status:** Draft
 
 ---
 
 ## 1. Overview
 
-### 1.1 Цель
+### 1.1 Purpose
 
-Nix модуль для декларативного бутстрапа bare-metal Kubernetes кластера на NixOS с последующей установкой Cozystack. Результат — идемпотентный скрипт `nix run .#bootstrap`, который приводит инфраструктуру в желаемое состояние.
+Declarative NixOS-based Kubernetes cluster provisioning with optional Cozystack installation. Configuration is YAML-serializable for external tooling integration.
 
-### 1.2 Ключевые принципы
+### 1.2 Key Principles
 
-- **Декларативность** — вся конфигурация в Nix
-- **Идемпотентность** — повторный запуск безопасен
-- **Расширяемость** — легко добавить DRBD, специфичные драйверы, custom configs
-- **Модульность** — drv-parts или module system для композиции
+- **Declarative** — all configuration in Nix, YAML-serializable
+- **Idempotent** — re-running is safe
+- **Extensible** — easy to add DRBD, GPU drivers, custom configs
+- **Modular** — flake-parts module system
+- **Separation of concerns** — WHAT (nodes, cluster) vs HOW (provisioning)
 
 ### 1.3 Scope
 
-| В scope | Вне scope |
-|---------|-----------|
-| NixOS на bare-metal нодах | Cloud providers |
-| Vanilla Kubernetes (kubeadm) | k3s, Talos |
-| PXE boot, nixos-rebuild, nixos-anywhere | ISO installation |
-| Cozystack bootstrap | Application workloads |
-| 1 control-plane + 1 worker → 3 CP + N workers | Single-node dev setup |
+| In scope | Out of scope |
+|----------|--------------|
+| NixOS on bare-metal nodes | Cloud providers (initially) |
+| k3s Kubernetes | kubeadm, Talos |
+| nixos-anywhere, PXE, Lima | ISO installation |
+| Optional Cozystack bootstrap | Application workloads |
 
 ---
 
-## 2. Архитектура
+## 2. Architecture
 
-### 2.1 High-Level Architecture
+### 2.1 Three-Layer Configuration
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    nix run .#bootstrap                          │
+│                          nodes                                   │
+│                    (HARDWARE / OS)                              │
+│                                                                  │
+│  MAC addresses, disks, drivers, extensions                      │
+│  YAML-serializable, freeform                                    │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │ Discovery    │  │ Provisioning │  │ Kubernetes Bootstrap │  │
-│  │ & Validation │─▶│ (NixOS)      │─▶│ & Cozystack Install  │  │
-│  └──────────────┘  └──────────────┘  └──────────────────────┘  │
-│         │                 │                     │               │
-│         ▼                 ▼                     ▼               │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │ Inventory    │  │ NixOS Configs│  │ kubeadm configs      │  │
-│  │ (nodes.nix)  │  │ per node     │  │ Cozystack manifests  │  │
-│  └──────────────┘  └──────────────┘  └──────────────────────┘  │
-│                                                                 │
+│                                                                  │
+│  server-nvme = {                      agent-gpu = {             │
+│    network.mac = "aa:...:01";           network.mac = "aa:...:20";│
+│    install.disk = "/dev/nvme0n1";       install.disk = "/dev/sda";│
+│    extensions.drbd.enable = true;       extensions.nvidia.enable │
+│  };                                       = true;                │
+│                                       };                         │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ reference by name
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        clusters                                  │
+│                    (CLUSTER / K8S)                              │
+│                                                                  │
+│  Multiple clusters, each with members (node → role + IP)        │
+│  YAML-serializable, freeform                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  prod = {                          dev = {                      │
+│    k3s.version = "v1.31.0+k3s1";     k3s.version = "v1.31.0+k3s1";│
+│    ha.vip = "192.168.1.100";         ha.enable = false;         │
+│    members = {                       members = {                │
+│      server1 = { node = "server-nvme"; server = { node = "lima";│
+│                  role = "server";            ... };             │
+│                  ip = "192.168.1.10"; };  };                    │
+│    };                               };                          │
+│  };                                                             │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ + provisioning settings
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       provisioning                               │
+│                    (HOW TO DEPLOY)                              │
+│                                                                  │
+│  Provisioner configurations — generates deployment scripts      │
+│  YAML-serializable, freeform                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  nixos-anywhere.ssh = { user = "root"; keyFile = "..."; };     │
+│  pxe.server = { ip = "192.168.1.1"; dhcp.range = "..."; };     │
+│  lima = { cpus = 2; memory = "4GiB"; };                        │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ generates
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      Flake Outputs                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  nixosConfigurations.{prod-server1, prod-agent1, dev-server, ...}│
+│    (includes k3s server/agent systemd services)                 │
+│                                                                  │
+│  apps.x86_64-linux = {                                         │
+│    nixos-anywhere-prod-server1   # install + join cluster      │
+│    nixos-anywhere-prod-all       # install all nodes in prod   │
+│    lima-up-dev                   # local dev VMs               │
+│    rebuild-prod-server1          # nixos-rebuild               │
+│    ssh-prod-server1              # quick SSH access            │
+│    kubeconfig-prod               # fetch admin kubeconfig      │
+│    gen-secrets                   # generate cluster secrets    │
+│  };                                                             │
+│                                                                  │
+│  packages.x86_64-linux.config-yaml                             │
+│                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 Module Structure
+### 2.2 YAML Compatibility
+
+Configuration can be imported from YAML (one-way: YAML → Nix). Most attributes are YAML-serializable, but some Nix-only features exist.
+
+```nix
+# YAML-serializable (data only)
+nodes.server1 = {
+  network.mac = "aa:bb:cc:dd:ee:01";
+  install.disk = "/dev/sda";
+  extensions.nvidia.enable = true;
+};
+
+# Nix-only (functions, paths — not available in YAML)
+nodes.server1 = {
+  nixosModules = [
+    ./custom.nix                          # path — Nix only
+    ({ config, ... }: { ... })            # function — Nix only
+  ];
+};
+```
+
+**YAML users**: use only data attributes (strings, numbers, bools, lists, attrs).
+**Nix users**: full power including `nixosModules` for custom NixOS config.
+
+### 2.3 Extensibility Architecture (freeformType)
+
+All three configuration layers use `freeformType` for maximum extensibility. Each flake-parts module can:
+
+1. **Read** any attribute from `config.nix8s.*`
+2. **Validate** via `assertions`
+3. **Generate** outputs (nixosConfigurations, apps)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      flake-parts/core.nix                        │
+│                                                                  │
+│  options.nix8s.nodes = attrsOf (submodule {                     │
+│    freeformType = attrsOf anything;                             │
+│    options = { network.mac = ...; };  # only critical options   │
+│  });                                                             │
+│                                                                  │
+│  options.nix8s.clusters = attrsOf (submodule {                  │
+│    freeformType = attrsOf anything;                             │
+│    options = { k3s.version = ...; members = ...; };             │
+│  });                                                             │
+│                                                                  │
+│  options.nix8s.provisioning = submodule {                       │
+│    freeformType = attrsOf anything;                             │
+│  };                                                              │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+          │
+          │ modules read config.nix8s.* and generate outputs
+          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Extension modules (each is independent flake-parts module)      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  haproxy.nix                                                    │
+│    reads: clusters.*.ha.haproxy.*                               │
+│    validates: vip required when enabled                         │
+│    outputs: adds NixOS module to server nodes of that cluster   │
+│             (services.haproxy + services.keepalived)            │
+│                                                                  │
+│  cozystack.nix                                                  │
+│    reads: clusters.*.cozystack.*                                │
+│    outputs: post-install manifests, apps                        │
+│                                                                  │
+│  nixos-anywhere.nix                                             │
+│    reads: provisioning.nixos-anywhere.*                         │
+│    outputs: apps.nixos-anywhere-{cluster}-{node}                │
+│                                                                  │
+│  lima.nix                                                       │
+│    reads: provisioning.lima.*                                   │
+│    outputs: apps.lima-up-{cluster}, lima-down-{cluster}         │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**How extension modules add NixOS config to specific nodes:**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Example: haproxy.nix flow                                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. Read clusters.prod.ha.haproxy = { enable = true; vip = ..}  │
+│                                                                  │
+│  2. Find all server members in prod cluster:                    │
+│     clusters.prod.members where role == "server"                │
+│     → [server1, server2, server3]                               │
+│                                                                  │
+│  3. For each server, add to nixosConfigurations.prod-{server}:  │
+│     - services.haproxy (backends = all server IPs)              │
+│     - services.keepalived (VIP failover)                        │
+│                                                                  │
+│  Result:                                                         │
+│    nixosConfigurations.prod-server1 includes HAProxy module     │
+│    nixosConfigurations.prod-server2 includes HAProxy module     │
+│    nixosConfigurations.prod-server3 includes HAProxy module     │
+│    nixosConfigurations.prod-agent1 does NOT include HAProxy     │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Example extension module:**
+
+```nix
+# flake-parts/haproxy.nix
+{ lib, config, ... }:
+
+let
+  cfg = config.nix8s;
+
+  # Helper for safe attribute access
+  getOr = default: path: attrs:
+    lib.attrByPath path default attrs;
+
+  # Get server members for a cluster
+  getServerMembers = cluster:
+    lib.filterAttrs (_: m: m.role == "server") (cluster.members or {});
+
+  # Generate HAProxy NixOS module for a specific node
+  mkHAProxyModule = { cluster, clusterName, allServerIPs }:
+    let
+      haproxy = cluster.ha.haproxy;
+    in
+    { config, ... }: {
+      services.haproxy = {
+        enable = true;
+        config = ''
+          frontend kubernetes-api
+            bind *:6443
+            default_backend kube-apiservers
+
+          backend kube-apiservers
+            balance roundrobin
+            ${lib.concatMapStrings (ip: "server srv-${ip} ${ip}:6443 check\n") allServerIPs}
+        '';
+      };
+
+      services.keepalived = {
+        enable = true;
+        vrrpInstances.k8s-api = {
+          virtualIps = [{ addr = "${haproxy.vip}/24"; }];
+          interface = haproxy.interface or "eth0";
+        };
+      };
+    };
+in
+{
+  # Validation
+  config.assertions = lib.flatten (
+    lib.mapAttrsToList (clusterName: cluster:
+      let
+        haproxy = cluster.ha.haproxy or {};
+      in
+      lib.optionals (haproxy.enable or false) [
+        {
+          assertion = haproxy ? vip;
+          message = "clusters.${clusterName}.ha.haproxy.vip is required";
+        }
+      ]
+    ) cfg.clusters
+  );
+
+  # Add HAProxy module to server nodes
+  # This merges with nixosConfigurations generated by outputs.nix
+  config.nix8s.nixosModulesFor = lib.mkMerge (
+    lib.mapAttrsToList (clusterName: cluster:
+      let
+        haproxy = cluster.ha.haproxy or {};
+        serverMembers = getServerMembers cluster;
+        allServerIPs = lib.mapAttrsToList (_: m: m.ip) serverMembers;
+      in
+      lib.optionalAttrs (haproxy.enable or false) (
+        lib.mapAttrs' (memberName: member:
+          lib.nameValuePair "${clusterName}-${memberName}" [
+            (mkHAProxyModule { inherit cluster clusterName allServerIPs; })
+          ]
+        ) serverMembers
+      )
+    ) cfg.clusters
+  );
+}
+```
+
+**Key concept:** Extensions write to `nixosModulesFor.<node-name>` which is collected by `outputs.nix`. Users can also add custom modules directly via `nodes.<name>.nixosModules`.
+
+### 2.4 Output Generation
+
+`outputs.nix` collects modules from all extensions and builds final `nixosConfigurations`:
+
+```nix
+# flake-parts/outputs.nix (simplified)
+{ lib, config, inputs, ... }:
+
+let
+  cfg = config.nix8s;
+
+  # Collect NixOS modules for each node from extensions + node template
+  modulesFor = nodeName: nodeTemplate:
+    (cfg.nixosModulesFor.${nodeName} or [])
+    ++ (nodeTemplate.nixosModules or []);
+in
+{
+  # Extensions add modules here (per node)
+  options.nix8s.nixosModulesFor = lib.mkOption {
+    type = lib.types.attrsOf (lib.types.listOf lib.types.deferredModule);
+    default = {};
+    description = "Additional NixOS modules for specific nodes (by full name: cluster-member)";
+  };
+
+  config.flake.nixosConfigurations = lib.mkMerge (
+    lib.mapAttrsToList (clusterName: cluster:
+      lib.mapAttrs' (memberName: member:
+        let
+          nodeName = "${clusterName}-${memberName}";
+          nodeTemplate = cfg.nodes.${member.node};
+        in
+        lib.nameValuePair nodeName (lib.nixosSystem {
+          modules = [
+            # Base modules
+            ./modules/nixos/base.nix
+            ./modules/nixos/k3s.nix
+
+            # Node template config (install, extensions, etc.)
+            (mkNodeConfig nodeTemplate member)
+
+            # Cluster context passed as specialArgs
+            { _module.args.nix8s = { inherit cluster member; }; }
+
+            # Extensions + user modules from node template
+          ] ++ (modulesFor nodeName nodeTemplate);
+        })
+      ) cluster.members
+    ) cfg.clusters
+  );
+}
+```
+
+### 2.5 Module Structure
 
 ```
 flake.nix
+├── flake-parts/
+│   ├── core.nix               # freeform options: nodes, clusters, provisioning
+│   ├── outputs.nix            # generates nixosConfigurations from clusters
+│   ├── apps/
+│   │   └── gen-secrets.nix    # nix run .#gen-secrets
+│   │
+│   ├── # Cluster extensions (read clusters.*)
+│   ├── haproxy.nix            # clusters.*.ha.haproxy → NixOS HAProxy config
+│   ├── cozystack.nix          # clusters.*.cozystack → manifests
+│   ├── secrets.nix            # clusters.*.secrets → validation
+│   │
+│   ├── # Node extensions (read nodes.*)
+│   ├── install.nix            # nodes.*.install → disko config
+│   ├── disko.nix              # nodes.*.disko → passthrough
+│   ├── nvidia.nix             # nodes.*.extensions.nvidia → NixOS config
+│   ├── drbd.nix               # nodes.*.extensions.drbd → NixOS config
+│   │
+│   └── # Provisioners (read provisioning.*)
+│       ├── nixos-anywhere.nix # provisioning.nixos-anywhere → apps
+│       ├── pxe.nix            # provisioning.pxe → apps
+│       └── lima.nix           # provisioning.lima → apps
+│
 ├── modules/
-│   ├── cluster/
-│   │   ├── default.nix          # Main cluster module
-│   │   ├── topology.nix         # Node roles, counts, networking
-│   │   └── options.nix          # All cluster options
-│   │
-│   ├── node/
-│   │   ├── default.nix          # Base NixOS config for k8s node
-│   │   ├── control-plane.nix    # CP-specific (etcd, apiserver)
-│   │   ├── worker.nix           # Worker-specific
-│   │   └── extensions/
-│   │       ├── drbd.nix         # DRBD kernel module + tools
-│   │       ├── gpu.nix          # NVIDIA/AMD drivers
-│   │       └── storage.nix      # Local storage, LVM
-│   │
-│   ├── disko/                   # Declarative disk partitioning
-│   │   ├── default.nix          # Main disko module with options
-│   │   ├── lib.nix              # Helper functions for disk configs
-│   │   └── profiles/
-│   │       ├── simple.nix       # Single disk, GPT + EFI
-│   │       ├── lvm.nix          # LVM-based flexible layout
-│   │       ├── zfs.nix          # ZFS with datasets
-│   │       ├── raid.nix         # Software RAID (mdadm)
-│   │       └── etcd-optimized.nix # Separate NVMe for etcd
-│   │
-│   ├── provisioning/            # Modular provisioning system
-│   │   ├── default.nix          # Base provisioning interface
-│   │   ├── options.nix          # Common options for all methods
-│   │   ├── methods/
-│   │   │   ├── nixos-anywhere.nix  # Remote installation
-│   │   │   ├── pxe.nix             # PXE boot server
-│   │   │   ├── nixos-rebuild.nix   # In-place rebuild
-│   │   │   └── manual.nix          # Manual (skip provisioning)
-│   │   └── lib/
-│   │       ├── activation.nix   # Activation script helpers
-│   │       ├── hooks.nix        # Hook system
-│   │       └── healthcheck.nix  # Health check utilities
-│   │
-│   ├── kubernetes/
-│   │   ├── kubeadm.nix          # kubeadm init/join configs
-│   │   ├── kubelet.nix          # kubelet service config
-│   │   ├── containerd.nix       # Container runtime
-│   │   └── certificates.nix     # PKI management
-│   │
-│   └── cozystack/
-│       ├── installer.nix        # Cozystack bootstrap
-│       └── config.nix           # Cozystack configuration
+│   └── nixos/
+│       ├── base.nix           # base NixOS config for all nodes
+│       ├── k3s.nix            # k3s server/agent, containerd
+│       ├── server.nix         # server-specific config
+│       └── agent.nix          # agent-specific config
 │
 ├── lib/
-│   ├── inventory.nix            # Node inventory helpers
-│   ├── network.nix              # Network calculations
-│   ├── idempotent.nix           # Idempotency helpers
-│   └── mkNodeConfig.nix         # Node configuration generator
-│
-├── apps/
-│   └── bootstrap/
-│       └── default.nix          # nix run .#bootstrap entrypoint
-│
-├── nodes/                       # Per-node custom configurations
-│   ├── cp1/
-│   │   ├── hardware.nix         # Hardware-specific settings
-│   │   └── network.nix          # Custom networking
-│   ├── cp2/
-│   │   └── hardware.nix
-│   └── worker-gpu/
-│       └── nvidia.nix           # GPU configuration
+│   └── helpers.nix            # getOr, filterMembers, etc.
 │
 └── examples/
-    ├── minimal/                 # 1 CP + 1 Worker
-    ├── ha/                      # 3 CP + N Workers
-    └── with-drbd/               # With DRBD storage
+    ├── minimal/               # 1 server + 1 agent
+    ├── ha/                    # 3 servers + N agents
+    ├── multi-cluster/         # prod + staging + dev
+    └── lima/                  # Local development
 ```
+
+### 2.6 Flake-Parts Module Architecture
+
+#### Layer Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     USER CONFIGURATION                           │
+│                                                                  │
+│  nix8s.nodes = { ... };                                         │
+│  nix8s.clusters = { ... };                                      │
+│  nix8s.provisioning = { ... };                                  │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ read by
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    FLAKE-PARTS MODULES                           │
+│                  (separation of concerns)                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
+│  │  core.nix   │  │ outputs.nix │  │  apps/*.nix │              │
+│  │             │  │             │  │             │              │
+│  │ Defines     │  │ Builds      │  │ Generates   │              │
+│  │ options     │  │ nixosConfig │  │ flake apps  │              │
+│  └─────────────┘  └─────────────┘  └─────────────┘              │
+│         │                │                │                      │
+│         │         ┌──────┴──────┐         │                      │
+│         │         ▼             ▼         │                      │
+│  ┌─────────────────────────────────────────────────┐            │
+│  │              EXTENSION MODULES                   │            │
+│  │                                                  │            │
+│  │  haproxy.nix   nvidia.nix   install.nix  ...   │            │
+│  │                                                  │            │
+│  │  Each module:                                    │            │
+│  │  1. Reads specific config path                   │            │
+│  │  2. Validates with assertions                    │            │
+│  │  3. Contributes to nixosModulesFor.<node>       │            │
+│  │                                                  │            │
+│  └─────────────────────────────────────────────────┘            │
+│                              │                                   │
+└──────────────────────────────│───────────────────────────────────┘
+                               │
+                               │ collected by outputs.nix
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      FLAKE OUTPUTS                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  nixosConfigurations.prod-server1 = ...                         │
+│  nixosConfigurations.prod-agent1 = ...                          │
+│  apps.x86_64-linux.nixos-anywhere-prod-server1 = ...            │
+│  apps.x86_64-linux.gen-secrets = ...                            │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Module Responsibilities
+
+| Module | Reads | Writes | Purpose |
+|--------|-------|--------|---------|
+| `core.nix` | — | `options.nix8s.*` | Define freeform options structure |
+| `outputs.nix` | `config.nix8s.*`, `nixosModulesFor` | `flake.nixosConfigurations` | Build final NixOS configs |
+| `haproxy.nix` | `clusters.*.ha.haproxy` | `nixosModulesFor.<server>` | Add HAProxy to server nodes |
+| `install.nix` | `nodes.*.install` | `nixosModulesFor.<node>` | Generate disko config |
+| `nvidia.nix` | `nodes.*.extensions.nvidia` | `nixosModulesFor.<node>` | Add NVIDIA drivers |
+| `nixos-anywhere.nix` | `provisioning.nixos-anywhere` | `apps.*` | Generate provisioning apps |
+
+#### Data Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       DATA FLOW                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. USER DEFINES CONFIG                                         │
+│     ┌─────────────────────────────────────────────────────┐    │
+│     │ nix8s.nodes.server-nvme = {                         │    │
+│     │   install.disk = "/dev/nvme0n1";                    │    │
+│     │   extensions.nvidia.enable = true;                  │    │
+│     │ };                                                   │    │
+│     │                                                      │    │
+│     │ nix8s.clusters.prod = {                             │    │
+│     │   ha.haproxy = { enable = true; vip = "..."; };    │    │
+│     │   members.server1 = {                               │    │
+│     │     node = "server-nvme";                           │    │
+│     │     role = "server";                                │    │
+│     │     ip = "192.168.1.10";                           │    │
+│     │   };                                                │    │
+│     │ };                                                   │    │
+│     └─────────────────────────────────────────────────────┘    │
+│                              │                                   │
+│                              ▼                                   │
+│  2. EXTENSION MODULES READ & CONTRIBUTE                         │
+│     ┌─────────────────────────────────────────────────────┐    │
+│     │                                                      │    │
+│     │  install.nix reads nodes.*.install                  │    │
+│     │    → writes nixosModulesFor.prod-server1 += [disko] │    │
+│     │                                                      │    │
+│     │  nvidia.nix reads nodes.*.extensions.nvidia         │    │
+│     │    → writes nixosModulesFor.prod-server1 += [nvidia]│    │
+│     │                                                      │    │
+│     │  haproxy.nix reads clusters.*.ha.haproxy            │    │
+│     │    → writes nixosModulesFor.prod-server1 += [haprox]│    │
+│     │                                                      │    │
+│     └─────────────────────────────────────────────────────┘    │
+│                              │                                   │
+│                              ▼                                   │
+│  3. OUTPUTS.NIX COLLECTS & BUILDS                               │
+│     ┌─────────────────────────────────────────────────────┐    │
+│     │                                                      │    │
+│     │  For each cluster.member:                           │    │
+│     │    1. Resolve node template                         │    │
+│     │    2. Merge member overrides                        │    │
+│     │    3. Collect nixosModulesFor.<name>               │    │
+│     │    4. Build nixosSystem                             │    │
+│     │                                                      │    │
+│     │  nixosConfigurations.prod-server1 = nixosSystem {   │    │
+│     │    modules = [                                      │    │
+│     │      base.nix                                       │    │
+│     │      k3s.nix                                        │    │
+│     │      { _module.args.nix8s = { cluster, member, node }; }│ │
+│     │    ] ++ nixosModulesFor.prod-server1;              │    │
+│     │  };                                                  │    │
+│     │                                                      │    │
+│     └─────────────────────────────────────────────────────┘    │
+│                              │                                   │
+│                              ▼                                   │
+│  4. NIXOS MODULE RECEIVES CONTEXT                               │
+│     ┌─────────────────────────────────────────────────────┐    │
+│     │                                                      │    │
+│     │  # modules/nixos/k3s.nix                            │    │
+│     │  { nix8s, ... }:                                    │    │
+│     │                                                      │    │
+│     │  nix8s.cluster  = { k3s, ha, secrets, members, ... }│    │
+│     │  nix8s.member   = { name, role, ip }               │    │
+│     │  nix8s.node     = { install, extensions, ... }     │    │
+│     │                      (merged: template + overrides) │    │
+│     │                                                      │    │
+│     └─────────────────────────────────────────────────────┘    │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Extension Module Pattern
+
+Each extension module follows the same pattern:
+
+```nix
+# flake-parts/extensions/<name>.nix
+{ lib, config, ... }:
+
+let
+  cfg = config.nix8s;
+in
+{
+  # 1. VALIDATION (optional)
+  config.assertions = lib.flatten (
+    lib.mapAttrsToList (clusterName: cluster:
+      # validate cluster config
+    ) cfg.clusters
+  );
+
+  # 2. CONTRIBUTE NIXOS MODULES
+  config.nix8s.nixosModulesFor = lib.mkMerge (
+    # For each node that matches criteria,
+    # add NixOS modules to nixosModulesFor.<cluster>-<member>
+  );
+
+  # 3. CONTRIBUTE APPS (optional)
+  config.perSystem = { pkgs, ... }: {
+    apps.<name> = { ... };
+  };
+}
+```
+
+#### Merge Order Summary
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      MERGE ORDER                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  CONFIG MERGE (data):                                           │
+│                                                                  │
+│    nodes.<template>                    (base hardware config)   │
+│           │                                                      │
+│           ▼ lib.recursiveUpdate                                 │
+│    member overrides                    (per-member customization)│
+│           │                                                      │
+│           ▼                                                      │
+│    final nodeConfig                    (used in NixOS)          │
+│                                                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  NIXOS MODULES MERGE (behavior):                                │
+│                                                                  │
+│    base.nix                            (common NixOS config)    │
+│           +                                                      │
+│    k3s.nix                             (k3s server/agent)       │
+│           +                                                      │
+│    node.nixosModules                   (user modules - public)  │
+│           +                                                      │
+│    nixosModulesFor.<node>              (extension modules - internal)
+│      ├── disko module                  (from install.nix)       │
+│      ├── nvidia module                 (from nvidia.nix)        │
+│      └── haproxy module                (from haproxy.nix)       │
+│           │                                                      │
+│           ▼ lib.mkMerge                                         │
+│    final NixOS configuration                                    │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### NixOS Modules: Public vs Internal
+
+Two separate mechanisms for adding NixOS modules (avoids infinite recursion):
+
+| Attribute | Who writes | Who reads | Purpose |
+|-----------|------------|-----------|---------|
+| `nodes.*.nixosModules` | User | `outputs.nix` | User's custom NixOS modules |
+| `nixosModulesFor.<node>` | Extensions | `outputs.nix` | Extension-generated modules |
+
+**Why separate?**
+
+```nix
+# ❌ INFINITE RECURSION — extension reads and writes same attr
+config.nix8s.nodes.server.nixosModules =
+  config.nix8s.nodes.server.nixosModules ++ [ myModule ];
+
+# ✅ SAFE — extension writes to different attr, never reads it
+config.nix8s.nixosModulesFor."prod-server1" = [ myModule ];
+```
+
+**Collection in outputs.nix:**
+
+```nix
+# outputs.nix
+nixosSystem {
+  modules = [
+    base.nix
+    k3s.nix
+    { _module.args.nix8s = { inherit cluster member node; }; }
+  ]
+  ++ (node.nixosModules or [])              # user modules (public)
+  ++ (cfg.nixosModulesFor.${name} or []);   # extension modules (internal)
+}
+```
+
+**Rules:**
+- Extensions **only write** to `nixosModulesFor`, **never read** it
+- User **only writes** to `nodes.*.nixosModules`
+- `outputs.nix` **reads both** and merges
+
+#### Separation of Concerns
+
+| Concern | Where | Why |
+|---------|-------|-----|
+| **What hardware** | `nodes.*` | Reusable templates, YAML-serializable |
+| **What cluster** | `clusters.*` | Cluster topology, k3s config, secrets |
+| **What features** | `extensions.*` | Enable/disable via flags |
+| **How to deploy** | `provisioning.*` | Deployment method configuration |
+| **Feature implementation** | `flake-parts/*.nix` | Isolated, composable modules |
+| **NixOS behavior** | `modules/nixos/*.nix` | Actual system configuration |
 
 ---
 
 ## 3. Configuration Schema
 
-### 3.1 Architecture Overview
+### 3.1 nodes — Hardware/OS Configuration
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          clusterConfig                               │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  ┌──────────────────────────────────────────────────────────────┐   │
-│  │                    nodeConfigurations                         │   │
-│  │                    (ЧТО деплоим)                              │   │
-│  ├──────────────────────────────────────────────────────────────┤   │
-│  │  base                     ← базовый для всех                 │   │
-│  │    ├─ control-plane-nvme  ← extends base, role=control-plane │   │
-│  │    ├─ worker-standard     ← extends base, role=worker        │   │
-│  │    ├─ worker-gpu          ← extends worker-standard          │   │
-│  │    └─ worker-storage      ← extends worker-standard          │   │
-│  └──────────────────────────────────────────────────────────────┘   │
-│                                                                      │
-│  ┌──────────────────────────────────────────────────────────────┐   │
-│  │                      provisioners                             │   │
-│  │                    (КАК деплоим)                              │   │
-│  ├──────────────────────────────────────────────────────────────┤   │
-│  │                                                               │   │
-│  │  nixos-anywhere = {          pxe = {                         │   │
-│  │    nodes = {                   server = {...};               │   │
-│  │      cp1 = {...};              nodes = {                     │   │
-│  │      cp2 = {...};                worker-dc2 = {...};         │   │
-│  │      worker1 = {...};          };                            │   │
-│  │    };                        };                              │   │
-│  │  };                                                          │   │
-│  │                              terraform = {                   │   │
-│  │  manual = {                    provider = "hcloud";          │   │
-│  │    nodes = {                   nodes = {                     │   │
-│  │      legacy = {...};             worker-cloud = {...};       │   │
-│  │    };                          };                            │   │
-│  │  };                          };                              │   │
-│  │                                                               │   │
-│  └──────────────────────────────────────────────────────────────┘   │
-│                                                                      │
-│                              ↓                                       │
-│                    Bootstrap Pipeline                                │
-│                              ↓                                       │
-│         ┌─────────────────────────────────────┐                     │
-│         │  1. Collect nodes from provisioners │                     │
-│         │  2. Resolve role from configuration │                     │
-│         │  3. Run each provisioner            │                     │
-│         │  4. Kubernetes bootstrap            │                     │
-│         │  5. Cozystack install               │                     │
-│         └─────────────────────────────────────┘                     │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+Two disk configuration modes are supported: **simple** (opinionated defaults) and **custom** (raw disko passthrough).
 
-### 3.2 Cluster Definition (flake.nix)
+#### Mode 1: Simple (opinionated)
+
+Specify `install.disk` and optional parameters. Internally expands to a standard disko config:
+- GPT partition table + EFI partition (512M)
+- Swap partition (if `install.swapSize` specified)
+- Root partition (ext4, remainder of disk)
+
+#### Mode 2: Custom (disko passthrough)
+
+Specify `disko` attribute with raw disko configuration for full control.
+
+**Note:** `install.disk` and `disko` are mutually exclusive.
 
 ```nix
-{
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    cozystack-bootstrap.url = "github:you/cozystack-bootstrap";
-    disko.url = "github:nix-community/disko";
+nodes = {
+  # ═══════════════════════════════════════════════════════════
+  # Example: Simple mode (opinionated)
+  # ═══════════════════════════════════════════════════════════
+  server-nvme = {
+    # ─────────────────────────────────────────────────────────
+    # Network identifiers (hardware)
+    # ─────────────────────────────────────────────────────────
+    network = {
+      mac = "aa:bb:cc:dd:ee:01";     # required for PXE
+      interface = "eth0";            # primary interface
+    };
+
+    # ─────────────────────────────────────────────────────────
+    # Install configuration (simple mode)
+    # ─────────────────────────────────────────────────────────
+    install = {
+      disk = "/dev/nvme0n1";         # required: root disk
+      swapSize = "16G";              # optional: swap partition
+    };
+
+    # ─────────────────────────────────────────────────────────
+    # Extensions (auto-imported, just enable)
+    # ─────────────────────────────────────────────────────────
+    extensions = {
+      drbd = {
+        enable = true;
+        devices = ["/dev/sdb" "/dev/sdc"];
+      };
+    };
+
+    # ─────────────────────────────────────────────────────────
+    # Boot configuration
+    # ─────────────────────────────────────────────────────────
+    boot = {
+      kernelParams = ["intel_idle.max_cstate=1"];
+      kernelModules = ["kvm-intel"];
+    };
+
+    # ─────────────────────────────────────────────────────────
+    # Hardware-specific
+    # ─────────────────────────────────────────────────────────
+    hardware = {
+      cpu.vendor = "intel";  # intel | amd
+      cpu.updateMicrocode = true;
+    };
+
+    # ─────────────────────────────────────────────────────────
+    # Custom NixOS modules (Nix only, not YAML-serializable)
+    # ─────────────────────────────────────────────────────────
+    nixosModules = [
+      ./my-custom-module.nix
+      ({ config, pkgs, ... }: {
+        services.prometheus.exporters.node.enable = true;
+      })
+    ];
   };
 
-  outputs = { self, nixpkgs, cozystack-bootstrap, ... }: {
+  # ═══════════════════════════════════════════════════════════
+  # Example: Simple mode (minimal)
+  # ═══════════════════════════════════════════════════════════
+  agent-gpu = {
+    network.mac = "aa:bb:cc:dd:ee:20";
+    install.disk = "/dev/sda";
 
-    clusterConfig = {
-      # ═══════════════════════════════════════════════════════
-      # Cluster Identity
-      # ═══════════════════════════════════════════════════════
-      name = "prod-cluster";
-      domain = "k8s.example.com";
+    extensions.nvidia = {
+      enable = true;
+      package = "stable";
+    };
+  };
 
-      # ═══════════════════════════════════════════════════════
-      # Kubernetes
-      # ═══════════════════════════════════════════════════════
-      kubernetes = {
-        version = "1.29";
-        podCidr = "10.244.0.0/16";
-        serviceCidr = "10.96.0.0/12";
-      };
+  agent-standard = {
+    network.mac = "aa:bb:cc:dd:ee:21";
+    install.disk = "/dev/sda";
+  };
 
-      # ═══════════════════════════════════════════════════════
-      # High Availability
-      # ═══════════════════════════════════════════════════════
-      ha = {
-        enabled = true;
-        loadBalancer = {
-          vip = "192.168.1.100";
-          interface = "eth0";
+  # Lima node (no MAC needed for Lima provisioner)
+  lima-node = {
+    install.disk = "/dev/vda";
+  };
+
+  # ═══════════════════════════════════════════════════════════
+  # Example: Custom mode (disko passthrough)
+  # ═══════════════════════════════════════════════════════════
+  agent-zfs = {
+    network.mac = "aa:bb:cc:dd:ee:30";
+
+    # Raw disko configuration for full control
+    disko = {
+      devices = {
+        disk = {
+          main = {
+            type = "disk";
+            device = "/dev/sda";
+            content = {
+              type = "gpt";
+              partitions = {
+                ESP = {
+                  size = "512M";
+                  type = "EF00";
+                  content = {
+                    type = "filesystem";
+                    format = "vfat";
+                    mountpoint = "/boot";
+                  };
+                };
+                zfs = {
+                  size = "100%";
+                  content = {
+                    type = "zfs";
+                    pool = "rpool";
+                  };
+                };
+              };
+            };
+          };
+        };
+        zpool = {
+          rpool = {
+            type = "zpool";
+            rootFsOptions = {
+              compression = "zstd";
+              "com.sun:auto-snapshot" = "false";
+            };
+            datasets = {
+              root = {
+                type = "zfs_fs";
+                mountpoint = "/";
+              };
+            };
+          };
         };
       };
-
-      # ═══════════════════════════════════════════════════════
-      # Cozystack
-      # ═══════════════════════════════════════════════════════
-      cozystack = {
-        version = "latest";
-      };
-
-      # ═══════════════════════════════════════════════════════
-      # Node Configurations (ЧТО деплоим)
-      # ═══════════════════════════════════════════════════════
-      nodeConfigurations = {
-        # См. секцию 3.3
-      };
-
-      # ═══════════════════════════════════════════════════════
-      # Provisioners (КАК деплоим)
-      # ═══════════════════════════════════════════════════════
-      provisioners = {
-        # См. секцию 3.4
-      };
     };
-
-    # Generated outputs
-    packages.x86_64-linux = cozystack-bootstrap.lib.mkClusterPackages {
-      inherit (self) clusterConfig;
-      pkgs = nixpkgs.legacyPackages.x86_64-linux;
-    };
-
-    nixosConfigurations = cozystack-bootstrap.lib.mkClusterNodes {
-      inherit (self) clusterConfig;
-      inherit nixpkgs;
-    };
-
-    apps.x86_64-linux.bootstrap = cozystack-bootstrap.lib.mkBootstrapApp {
-      inherit (self) clusterConfig;
-      pkgs = nixpkgs.legacyPackages.x86_64-linux;
-    };
-  };
-}
-```
-
-### 3.3 nodeConfigurations Schema
-
-```nix
-nodeConfigurations = {
-  # ─────────────────────────────────────────────────────────────
-  # Base — наследуется всеми
-  # ─────────────────────────────────────────────────────────────
-  base = {
-    # Какие NixOS профили включить
-    profiles = [ "base" "kubernetes" ];
-
-    # Прямые NixOS опции
-    nixos = {
-      services.openssh.enable = true;
-      nix.settings.experimental-features = [ "nix-command" "flakes" ];
-    };
-  };
-
-  # ─────────────────────────────────────────────────────────────
-  # Control Plane
-  # ─────────────────────────────────────────────────────────────
-  control-plane = {
-    extends = "base";
-    role = "control-plane";         # ← Роль определена здесь!
-    profiles = [ "control-plane" ];
-
-    disko.profile = "simple";
-  };
-
-  control-plane-nvme = {
-    extends = "control-plane";
-
-    disko.profile = "etcd-optimized";
-
-    nixos.boot.kernelParams = [ "intel_idle.max_cstate=1" ];
-  };
-
-  # ─────────────────────────────────────────────────────────────
-  # Workers
-  # ─────────────────────────────────────────────────────────────
-  worker = {
-    extends = "base";
-    role = "worker";                # ← Роль определена здесь!
-    profiles = [ "worker" ];
-
-    disko.profile = "simple";
-  };
-
-  worker-gpu = {
-    extends = "worker";
-
-    extensions.gpu.enable = true;
-
-    nixos.hardware.graphics.enable = true;
-  };
-
-  worker-storage = {
-    extends = "worker";
-
-    disko.profile = "lvm";
-
-    extensions.drbd.enable = true;
-  };
-
-  # ─────────────────────────────────────────────────────────────
-  # Minimal (для manual/legacy нод)
-  # ─────────────────────────────────────────────────────────────
-  worker-minimal = {
-    extends = "base";
-    role = "worker";
-
-    profiles = [ "worker" ];
-    disko.enable = false;           # Диск уже размечен
   };
 };
 ```
 
-### 3.4 provisioners Schema
+### 3.2 clusters — Cluster Configuration (multi-cluster)
 
-Каждый provisioner — независимый модуль со своими настройками и нодами:
+One flake can define multiple clusters. Each cluster is independent and generates its own nixosConfigurations and apps.
 
 ```nix
-provisioners = {
+clusters = {
+  # ═══════════════════════════════════════════════════════════
+  # Production cluster
+  # ═══════════════════════════════════════════════════════════
+  prod = {
+    domain = "k8s.example.com";
 
-  # ═══════════════════════════════════════════════════════════════
-  # nixos-anywhere — Remote installation via SSH
-  # ═══════════════════════════════════════════════════════════════
-  nixos-anywhere = {
-    # Настройки провиженера
-    defaults = {
-      ssh = {
-        user = "root";
-        keyFile = ./keys/deploy;
+    k3s = {
+      version = "v1.31.0+k3s1";
+
+      network = {
+        clusterCidr = "10.42.0.0/16";      # pod network
+        serviceCidr = "10.43.0.0/16";      # service network
+        clusterDns = "10.43.0.10";
       };
-      buildOnRemote = true;
-      kexec = true;
+
+      extraArgs = {
+        server = ["--disable=traefik"];    # extra args for servers
+        agent = [];                         # extra args for agents
+      };
     };
 
-    # Ноды для этого провиженера
-    nodes = {
-      cp1 = {
-        configuration = "control-plane-nvme";
+    ha = {
+      enable = true;
+      firstServer = "server1";
+
+      # VIP for HA (optional, can use external LB)
+      vip = "192.168.1.100";
+      interface = "eth0";
+    };
+
+    secrets = import ./secrets/prod.nix;   # from gen-secrets
+
+    cozystack.enable = true;
+
+    members = {
+      server1 = { node = "server-nvme"; role = "server"; ip = "192.168.1.10"; };
+      server2 = { node = "server-nvme"; role = "server"; ip = "192.168.1.11"; };
+      server3 = { node = "server-nvme"; role = "server"; ip = "192.168.1.12"; };
+      agent1 = { node = "agent-gpu"; role = "agent"; ip = "192.168.1.20"; };
+      agent2 = { node = "agent-standard"; role = "agent"; ip = "192.168.1.21"; };
+    };
+  };
+
+  # ═══════════════════════════════════════════════════════════
+  # Staging cluster (simpler setup)
+  # ═══════════════════════════════════════════════════════════
+  staging = {
+    k3s.version = "v1.31.0+k3s1";
+    ha.enable = false;
+
+    secrets = import ./secrets/staging.nix;
+
+    members = {
+      server = { node = "standard"; role = "server"; ip = "192.168.2.10"; };
+      agent = { node = "standard"; role = "agent"; ip = "192.168.2.20"; };
+    };
+  };
+
+  # ═══════════════════════════════════════════════════════════
+  # Local development (Lima)
+  # ═══════════════════════════════════════════════════════════
+  dev = {
+    k3s.version = "v1.31.0+k3s1";
+    ha.enable = false;
+
+    secrets = import ./secrets/dev.nix;
+
+    members = {
+      server = { node = "lima-node"; role = "server"; ip = "192.168.105.10"; };
+      agent = { node = "lima-node"; role = "agent"; ip = "192.168.105.11"; };
+    };
+  };
+};
+```
+
+**Generated outputs for multi-cluster:**
+
+```nix
+nixosConfigurations = {
+  # prod cluster
+  prod-server1 = ...;
+  prod-server2 = ...;
+  prod-server3 = ...;
+  prod-agent1 = ...;
+  prod-agent2 = ...;
+
+  # staging cluster
+  staging-server = ...;
+  staging-agent = ...;
+
+  # dev cluster
+  dev-server = ...;
+  dev-agent = ...;
+};
+
+apps.x86_64-linux = {
+  # prod
+  nixos-anywhere-prod-server1 = ...;
+  nixos-anywhere-prod-all = ...;
+  rebuild-prod-all = ...;
+  kubeconfig-prod = ...;
+
+  # staging
+  nixos-anywhere-staging-all = ...;
+  kubeconfig-staging = ...;
+
+  # dev (Lima)
+  lima-up-dev = ...;
+  lima-down-dev = ...;
+  kubeconfig-dev = ...;
+
+  # utilities
+  gen-secrets = ...;
+};
+```
+
+### 3.3 Member Schema
+
+```nix
+# clusters.<cluster>.members.<name>
+{
+  # ─────────────────────────────────────────────────────────────
+  # Required
+  # ─────────────────────────────────────────────────────────────
+  node = "template-name";              # string reference → nodes.*
+  # or
+  node = config.nix8s.nodes.server-nvme;  # direct reference (type-safe)
+
+  role = "server";                     # server | agent
+  ip = "192.168.1.10";                 # IP in cluster network (always explicit)
+
+  # ─────────────────────────────────────────────────────────────
+  # Overrides (merged with node config, freeform)
+  # ─────────────────────────────────────────────────────────────
+  install = { };                       # override node.install
+  disko = { };                         # override node.disko
+  extensions = { };                    # override node.extensions
+  boot = { };                          # override node.boot
+  hardware = { };                      # override node.hardware
+}
+```
+
+### 3.4 Node Reference Modes
+
+Two ways to reference node templates:
+
+| Mode | Syntax | Use case |
+| --- | --- | --- |
+| **String** | `node = "server-nvme";` | YAML-compatible, simple |
+| **Direct** | `node = config.nix8s.nodes.server-nvme;` | Type-safe, IDE autocomplete |
+
+```nix
+nix8s = {
+  nodes = {
+    server-nvme = { install.disk = "/dev/nvme0n1"; };
+    agent-gpu = { install.disk = "/dev/sda"; };
+  };
+
+  clusters.prod = {
+    members = {
+      # ─────────────────────────────────────────────────────────
+      # String reference (YAML-compatible)
+      # ─────────────────────────────────────────────────────────
+      server1 = {
+        node = "server-nvme";
+        role = "server";
         ip = "192.168.1.10";
-        ssh.host = "192.168.1.10";
-        disko.disks = {
-          main = "/dev/sda";
-          etcd = "/dev/nvme0n1";
-        };
       };
 
-      cp2 = {
-        configuration = "control-plane-nvme";
+      # ─────────────────────────────────────────────────────────
+      # Direct reference (type-safe, autocomplete)
+      # ─────────────────────────────────────────────────────────
+      server2 = {
+        node = config.nix8s.nodes.server-nvme;
+        role = "server";
         ip = "192.168.1.11";
-        ssh.host = "192.168.1.11";
-        disko.disks = {
-          main = "/dev/sda";
-          etcd = "/dev/nvme0n1";
-        };
       };
 
-      cp3 = {
-        configuration = "control-plane-nvme";
-        ip = "192.168.1.12";
-        ssh.host = "192.168.1.12";
-        disko.disks = {
-          main = "/dev/sda";
-          etcd = "/dev/nvme0n1";
-        };
-      };
-
-      worker1 = {
-        configuration = "worker-storage";
+      # ─────────────────────────────────────────────────────────
+      # Direct reference with inline override
+      # ─────────────────────────────────────────────────────────
+      agent1 = {
+        node = config.nix8s.nodes.agent-gpu;
+        role = "agent";
         ip = "192.168.1.20";
-        ssh.host = "192.168.1.20";
-        disko.disks = {
-          main = "/dev/sda";
-          data = [ "/dev/sdb" "/dev/sdc" ];
-        };
+        # Override node template settings
+        extensions.nvidia.package = "production";
       };
+    };
+  };
+};
+```
 
-      worker-gpu-01 = {
-        configuration = "worker-gpu";
-        ip = "192.168.1.21";
-        ssh.host = "192.168.1.21";
-        disko.disks.main = "/dev/nvme0n1";
+**Resolution and merge in outputs.nix:**
 
-        # Override для этой конкретной ноды
-        extensions.gpu.vendor = "nvidia";
-        modules = [ ./nodes/gpu-01/nvidia.nix ];
+```nix
+let
+  # Resolve node reference (string or attrset)
+  resolveNode = nodeRef:
+    if builtins.isAttrs nodeRef
+    then nodeRef                    # direct reference — already resolved
+    else cfg.nodes.${nodeRef} or    # string — lookup in nodes
+      (throw "Node '${nodeRef}' not found in nix8s.nodes");
+
+  # Member-specific attrs (not merged into node config)
+  memberAttrs = ["node" "role" "ip"];
+
+  # Build final node config: node template + member overrides
+  buildNodeConfig = member:
+    let
+      baseNode = resolveNode member.node;
+      memberOverrides = removeAttrs member memberAttrs;
+    in
+    lib.recursiveUpdate baseNode memberOverrides;
+in
+{
+  # Usage
+  nodeConfig = buildNodeConfig member;
+}
+```
+
+**Merge hierarchy:**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Config Merge Flow                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  nodes.server-nvme = {                 (base template)          │
+│    install.disk = "/dev/nvme0n1";                               │
+│    extensions.monitoring.enable = false;                        │
+│    extensions.drbd.enable = false;                              │
+│  };                                                              │
+│         │                                                        │
+│         │ lib.recursiveUpdate                                   │
+│         ▼                                                        │
+│  member overrides = {                  (from member definition) │
+│    extensions.monitoring.enable = true;                         │
+│    extensions.drbd.enable = true;                               │
+│  };                                                              │
+│         │                                                        │
+│         ▼                                                        │
+│  final nodeConfig = {                  (passed to NixOS module) │
+│    install.disk = "/dev/nvme0n1";      # from node             │
+│    extensions.monitoring.enable = true; # overridden by member │
+│    extensions.drbd.enable = true;       # overridden by member │
+│  };                                                              │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Example:**
+
+```nix
+nodes.server-nvme = {
+  install.disk = "/dev/nvme0n1";
+  network.interface = "eth0";
+  extensions.monitoring.enable = false;
+};
+
+clusters.prod.members = {
+  server1 = {
+    node = "server-nvme";
+    role = "server";
+    ip = "192.168.1.10";
+    # These override node template:
+    extensions.monitoring.enable = true;
+    boot.kernelParams = ["mitigations=off"];
+  };
+
+  server2 = {
+    node = "server-nvme";
+    role = "server";
+    ip = "192.168.1.11";
+    # Different disk for this member
+    install.disk = "/dev/sda";
+  };
+};
+
+# Result for server1:
+# {
+#   install.disk = "/dev/nvme0n1";        # from node
+#   network.interface = "eth0";           # from node
+#   extensions.monitoring.enable = true;  # overridden
+#   boot.kernelParams = ["mitigations=off"]; # added
+# }
+
+# Result for server2:
+# {
+#   install.disk = "/dev/sda";            # overridden
+#   network.interface = "eth0";           # from node
+#   extensions.monitoring.enable = false; # from node (not overridden)
+# }
+```
+
+### 3.5 provisioning — Deployment Configuration
+
+```nix
+provisioning = {
+  # ═══════════════════════════════════════════════════════════
+  # nixos-anywhere — Remote installation via SSH
+  # ═══════════════════════════════════════════════════════════
+  nixos-anywhere = {
+    ssh = {
+      user = "root";
+      port = 22;
+      keyFile = "/home/user/.ssh/id_ed25519";
+    };
+
+    buildOnRemote = true;
+    kexec = true;
+  };
+
+  # ═══════════════════════════════════════════════════════════
+  # PXE — Bare-metal provisioning via network boot
+  # ═══════════════════════════════════════════════════════════
+  pxe = {
+    server = {
+      ip = "192.168.1.1";
+      interface = "eth0";
+
+      dhcp = {
+        range = "192.168.1.100-192.168.1.200";
+        subnet = "192.168.1.0/24";
+        gateway = "192.168.1.1";
       };
     };
   };
 
-  # ═══════════════════════════════════════════════════════════════
-  # pxe — PXE Boot for bare-metal
-  # ═══════════════════════════════════════════════════════════════
-  pxe = {
-    # PXE server configuration
-    server = {
+  # ═══════════════════════════════════════════════════════════
+  # Lima — Local development VMs
+  # ═══════════════════════════════════════════════════════════
+  lima = {
+    cpus = 2;
+    memory = "4GiB";
+    disk = "30GiB";
+  };
+};
+```
+
+---
+
+## 4. Generated Outputs
+
+### 4.1 Integrated Provisioning
+
+k3s cluster bootstrap is integrated into provisioning — no separate bootstrap step needed.
+
+**How it works:**
+
+1. **NixOS configuration includes k3s setup** — first server runs `k3s server --cluster-init`, others join
+2. **Provisioner installs complete node** — after provisioning, node is already in the cluster
+3. **Idempotent** — re-provisioning is safe, k3s handles already-initialized nodes
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Provisioning Flow                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  nixos-anywhere / PXE / Lima                                    │
+│         │                                                        │
+│         ▼                                                        │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  NixOS Configuration                                     │   │
+│  │  ├── base system (disko, network, ssh)                  │   │
+│  │  ├── k3s package                                         │   │
+│  │  └── k3s systemd service:                               │   │
+│  │      ├── if first server → k3s server --cluster-init    │   │
+│  │      ├── if server → k3s server --server=https://...    │   │
+│  │      └── if agent → k3s agent --server=https://...      │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│         │                                                        │
+│         ▼                                                        │
+│  Node is provisioned AND in cluster                             │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 Output Structure
+
+App naming: `<provisioner>-<cluster>-<node>` or `<action>-<cluster>-<node>`
+
+```nix
+{
+  # NixOS configurations: <cluster>-<node>
+  nixosConfigurations = {
+    prod-server1 = <NixOS config>;     # k3s server --cluster-init
+    prod-server2 = <NixOS config>;     # k3s server --server=...
+    prod-server3 = <NixOS config>;
+    prod-agent1 = <NixOS config>;      # k3s agent --server=...
+    prod-agent2 = <NixOS config>;
+  };
+
+  # Provisioning apps: <provisioner>-<cluster>-<node>
+  apps.x86_64-linux = {
+    # ─────────────────────────────────────────────────────────
+    # nixos-anywhere — remote installation via SSH
+    # ─────────────────────────────────────────────────────────
+    nixos-anywhere-prod-server1 = { type = "app"; program = "..."; };
+    nixos-anywhere-prod-server2 = { type = "app"; program = "..."; };
+    nixos-anywhere-prod-server3 = { type = "app"; program = "..."; };
+    nixos-anywhere-prod-agent1 = { type = "app"; program = "..."; };
+    nixos-anywhere-prod-agent2 = { type = "app"; program = "..."; };
+    nixos-anywhere-prod-all = { type = "app"; program = "..."; };
+
+    # ─────────────────────────────────────────────────────────
+    # PXE — bare-metal network boot
+    # ─────────────────────────────────────────────────────────
+    pxe-server-prod = { type = "app"; program = "..."; };
+
+    # ─────────────────────────────────────────────────────────
+    # Lima — local development VMs
+    # ─────────────────────────────────────────────────────────
+    lima-up-dev = { type = "app"; program = "..."; };
+    lima-down-dev = { type = "app"; program = "..."; };
+    lima-status-dev = { type = "app"; program = "..."; };
+
+    # ─────────────────────────────────────────────────────────
+    # Node management: <action>-<cluster>-<node>
+    # ─────────────────────────────────────────────────────────
+    rebuild-prod-server1 = { type = "app"; program = "..."; };
+    rebuild-prod-all = { type = "app"; program = "..."; };
+
+    # ─────────────────────────────────────────────────────────
+    # Utilities
+    # ─────────────────────────────────────────────────────────
+    ssh-prod-server1 = { type = "app"; program = "..."; };
+    ssh-prod-agent1 = { type = "app"; program = "..."; };
+    kubeconfig-prod = { type = "app"; program = "..."; };
+    gen-secrets = { type = "app"; program = "..."; };
+  };
+
+  # Export config as YAML
+  packages.x86_64-linux.config-yaml = <derivation>;
+}
+```
+
+### 4.3 Usage Examples
+
+```bash
+# ─────────────────────────────────────────────────────────────
+# Generate secrets (first step for new cluster)
+# ─────────────────────────────────────────────────────────────
+nix run .#gen-secrets -- prod
+sops --encrypt --in-place secrets/prod.nix
+git add --force secrets/prod.nix
+
+# ─────────────────────────────────────────────────────────────
+# nixos-anywhere — remote installation via SSH
+# Format: nixos-anywhere-<cluster>-<node>
+# ─────────────────────────────────────────────────────────────
+nix run .#nixos-anywhere-prod-server1   # single node
+nix run .#nixos-anywhere-prod-all       # all nodes (servers first, then agents)
+
+# ─────────────────────────────────────────────────────────────
+# PXE — bare-metal network boot
+# Format: pxe-server-<cluster>
+# ─────────────────────────────────────────────────────────────
+nix run .#pxe-server-prod           # start server, nodes boot & join
+
+# ─────────────────────────────────────────────────────────────
+# Lima — local development VMs
+# Format: lima-<action>-<cluster>
+# ─────────────────────────────────────────────────────────────
+nix run .#lima-up-dev               # start all VMs
+nix run .#lima-status-dev           # show VM status
+nix run .#lima-down-dev             # stop all VMs
+
+# ─────────────────────────────────────────────────────────────
+# Node management
+# Format: rebuild-<cluster>-<node>
+# ─────────────────────────────────────────────────────────────
+nix run .#rebuild-prod-server1      # nixos-rebuild switch
+nix run .#rebuild-prod-all          # rebuild all nodes
+
+# ─────────────────────────────────────────────────────────────
+# Utilities
+# ─────────────────────────────────────────────────────────────
+nix run .#ssh-prod-server1          # SSH to node
+nix run .#kubeconfig-prod > ~/.kube/config
+
+# ─────────────────────────────────────────────────────────────
+# Export config
+# ─────────────────────────────────────────────────────────────
+nix build .#config-yaml
+cat result/config.yaml
+```
+
+---
+
+## 5. Complete Examples
+
+### 5.1 Minimal Example (1 server + 1 agent)
+
+```nix
+{
+  nodes = {
+    standard = {
+      network.mac = "aa:bb:cc:dd:ee:01";
+      install.disk = "/dev/sda";
+    };
+  };
+
+  clusters.dev = {
+    k3s.version = "v1.31.0+k3s1";
+    ha.enable = false;
+
+    secrets = import ./secrets/dev.nix;
+
+    members = {
+      server = {
+        node = "standard";
+        role = "server";
+        ip = "192.168.1.10";
+      };
+      agent = {
+        node = "standard";
+        role = "agent";
+        ip = "192.168.1.20";
+      };
+    };
+  };
+
+  provisioning.nixos-anywhere.ssh = {
+    user = "root";
+    keyFile = "/home/user/.ssh/id_ed25519";
+  };
+}
+```
+
+### 5.2 HA Production Example (3 servers + N agents)
+
+```nix
+{
+  nodes = {
+    server-nvme = {
+      network.mac = "aa:bb:cc:dd:ee:01";
+      install = {
+        disk = "/dev/nvme0n1";
+        swapSize = "16G";
+      };
+      boot.kernelParams = ["intel_idle.max_cstate=1"];
+      hardware.cpu.vendor = "intel";
+    };
+
+    agent-gpu = {
+      network.mac = "aa:bb:cc:dd:ee:20";
+      install.disk = "/dev/sda";
+      extensions.nvidia.enable = true;
+    };
+
+    agent-storage = {
+      network.mac = "aa:bb:cc:dd:ee:30";
+      install.disk = "/dev/sda";
+      extensions.drbd = {
+        enable = true;
+        devices = ["/dev/sdb" "/dev/sdc"];
+      };
+    };
+  };
+
+  clusters.prod = {
+    domain = "k8s.example.com";
+
+    k3s = {
+      version = "v1.31.0+k3s1";
+      network = {
+        clusterCidr = "10.42.0.0/16";
+        serviceCidr = "10.43.0.0/16";
+      };
+      extraArgs.server = ["--disable=traefik"];
+    };
+
+    ha = {
+      enable = true;
+      firstServer = "server1";
+      vip = "192.168.1.100";
+      interface = "eth0";
+    };
+
+    secrets = import ./secrets/prod.nix;
+
+    cozystack.enable = true;
+
+    members = {
+      server1 = { node = "server-nvme"; role = "server"; ip = "192.168.1.10"; };
+      server2 = { node = "server-nvme"; role = "server"; ip = "192.168.1.11"; };
+      server3 = { node = "server-nvme"; role = "server"; ip = "192.168.1.12"; };
+
+      agent-gpu-1 = { node = "agent-gpu"; role = "agent"; ip = "192.168.1.20"; };
+      agent-gpu-2 = { node = "agent-gpu"; role = "agent"; ip = "192.168.1.21"; };
+
+      agent-storage-1 = { node = "agent-storage"; role = "agent"; ip = "192.168.1.30"; };
+      agent-storage-2 = { node = "agent-storage"; role = "agent"; ip = "192.168.1.31"; };
+    };
+  };
+
+  provisioning = {
+    nixos-anywhere.ssh = {
+      user = "root";
+      keyFile = "/home/admin/.ssh/deploy_key";
+    };
+
+    pxe.server = {
       ip = "192.168.1.1";
       interface = "eth0";
       dhcp = {
@@ -436,4655 +1443,501 @@ provisioners = {
         subnet = "192.168.1.0/24";
       };
     };
-
-    # SSH для post-provisioning (kubeadm join)
-    defaults.ssh = {
-      user = "root";
-      keyFile = ./keys/deploy;
-    };
-
-    nodes = {
-      worker-dc2-01 = {
-        configuration = "worker";
-        ip = "10.20.1.50";
-        mac = "aa:bb:cc:dd:ee:50";
-        disko.disks.main = "/dev/sda";
-      };
-
-      worker-dc2-02 = {
-        configuration = "worker";
-        ip = "10.20.1.51";
-        mac = "aa:bb:cc:dd:ee:51";
-        disko.disks.main = "/dev/sda";
-      };
-    };
   };
-
-  # ═══════════════════════════════════════════════════════════════
-  # terraform — Cloud VMs (future)
-  # ═══════════════════════════════════════════════════════════════
-  terraform = {
-    # Provider configuration
-    provider = "hcloud";
-    backend = {
-      type = "s3";
-      bucket = "terraform-state";
-    };
-
-    defaults = {
-      location = "fsn1";
-      ssh_keys = [ "deploy-key" ];
-    };
-
-    nodes = {
-      worker-cloud-01 = {
-        configuration = "worker";
-        instance_type = "cx21";
-        # ip = "auto";  # Terraform назначит
-      };
-
-      worker-cloud-02 = {
-        configuration = "worker";
-        instance_type = "cx21";
-      };
-    };
-  };
-
-  # ═══════════════════════════════════════════════════════════════
-  # manual — Pre-configured nodes (skip provisioning)
-  # ═══════════════════════════════════════════════════════════════
-  manual = {
-    defaults.ssh = {
-      user = "root";
-      keyFile = ./keys/deploy;
-    };
-
-    # Опции для проверки
-    waitForSsh = true;
-    validateNixos = true;
-
-    nodes = {
-      worker-legacy = {
-        configuration = "worker-minimal";
-        ip = "192.168.1.200";
-        ssh.host = "192.168.1.200";
-      };
-
-      worker-external = {
-        configuration = "worker-minimal";
-        ip = "192.168.1.201";
-        ssh.host = "192.168.1.201";
-      };
-    };
-  };
-
-  # ═══════════════════════════════════════════════════════════════
-  # nixos-rebuild — Update existing NixOS machines
-  # ═══════════════════════════════════════════════════════════════
-  nixos-rebuild = {
-    defaults = {
-      ssh = {
-        user = "root";
-        keyFile = ./keys/deploy;
-      };
-      action = "switch";
-      # rollback.enable = true;
-    };
-
-    nodes = {
-      # Ноды которые уже имеют NixOS, просто обновляем
-    };
-  };
-};
-```
-
-### 3.5 Node Schema (inside provisioner)
-
-```nix
-# Схема ноды внутри любого provisioner.nodes.*
-{
-  # ─────────────────────────────────────────────────────────────
-  # Required
-  # ─────────────────────────────────────────────────────────────
-  configuration = "worker-gpu";      # → nodeConfigurations.*
-  ip = "192.168.1.21";               # IP в kubernetes сети
-
-  # ─────────────────────────────────────────────────────────────
-  # Provisioner-specific (зависит от типа)
-  # ─────────────────────────────────────────────────────────────
-
-  # Для nixos-anywhere, nixos-rebuild, manual:
-  ssh.host = "192.168.1.21";         # Может отличаться от ip
-
-  # Для pxe:
-  mac = "aa:bb:cc:dd:ee:21";
-
-  # Для terraform:
-  instance_type = "cx21";
-
-  # ─────────────────────────────────────────────────────────────
-  # NixOS Configuration overrides (optional)
-  # ─────────────────────────────────────────────────────────────
-  disko.disks.main = "/dev/nvme0n1"; # Override disk config
-  extensions.gpu.vendor = "nvidia";   # Override extension
-  modules = [ ./node-specific.nix ]; # Additional modules
-  nixos = { ... };                   # Direct NixOS options
 }
 ```
 
-### 3.6 Role Resolution
-
-Bootstrap скрипт определяет роль ноды через цепочку:
-
-```
-node.configuration → nodeConfigurations.X.role
-                   ↓
-         (with inheritance: extends → extends → ...)
-```
-
-```nix
-# lib/resolveRole.nix
-{ lib, nodeConfigurations }:
-
-let
-  # Рекурсивно резолвим extends
-  resolveConfig = name:
-    let
-      cfg = nodeConfigurations.${name};
-      parent = if cfg ? extends
-        then resolveConfig cfg.extends
-        else {};
-    in
-      lib.recursiveUpdate parent (builtins.removeAttrs cfg [ "extends" ]);
-
-in nodeName: nodeCfg:
-  let
-    resolved = resolveConfig nodeCfg.configuration;
-  in
-    resolved.role or (throw "No role defined for configuration: ${nodeCfg.configuration}")
-```
-
-### 3.7 Minimal Example
+### 5.3 Lima Development Example
 
 ```nix
 {
-  clusterConfig = {
-    name = "dev-cluster";
-
-    kubernetes = {
-      version = "1.29";
-      podCidr = "10.244.0.0/16";
-      serviceCidr = "10.96.0.0/12";
+  nodes = {
+    lima-node = {
+      install.disk = "/dev/vda";
     };
+  };
 
-    ha.enabled = false;
-    cozystack.version = "latest";
+  clusters.dev = {
+    k3s.version = "v1.31.0+k3s1";
+    ha.enable = false;
 
-    nodeConfigurations = {
-      base.profiles = [ "base" "kubernetes" ];
+    secrets = import ./secrets/dev.nix;
 
-      control-plane = {
-        extends = "base";
-        role = "control-plane";
-        disko.profile = "simple";
+    members = {
+      server = {
+        node = "lima-node";
+        role = "server";
+        ip = "192.168.105.10";
       };
-
-      worker = {
-        extends = "base";
-        role = "worker";
-        disko.profile = "simple";
-      };
-    };
-
-    provisioners.nixos-anywhere = {
-      defaults.ssh = {
-        user = "root";
-        keyFile = ./keys/deploy;
-      };
-
-      nodes = {
-        cp = {
-          configuration = "control-plane";
-          ip = "192.168.1.10";
-          ssh.host = "192.168.1.10";
-          disko.disks.main = "/dev/sda";
-        };
-
-        worker = {
-          configuration = "worker";
-          ip = "192.168.1.20";
-          ssh.host = "192.168.1.20";
-          disko.disks.main = "/dev/sda";
-        };
+      agent = {
+        node = "lima-node";
+        role = "agent";
+        ip = "192.168.105.11";
       };
     };
   };
-}
-```
 
-### 3.8 Reconciler Architecture
-
-Bootstrap скрипт работает как reconciler — приводит кластер к desired state:
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      Reconciler Loop                                 │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│   ┌─────────────┐      ┌──────────────┐      ┌─────────────┐       │
-│   │   Desired   │      │   Current    │      │    Diff     │       │
-│   │   State     │ ──▶  │    State     │ ──▶  │  (actions)  │       │
-│   │  (config)   │      │  (cluster)   │      │             │       │
-│   └─────────────┘      └──────────────┘      └──────┬──────┘       │
-│                                                      │              │
-│                                                      ▼              │
-│   ┌─────────────────────────────────────────────────────────────┐  │
-│   │                    Execute Actions                           │  │
-│   ├─────────────────────────────────────────────────────────────┤  │
-│   │  • Provision missing nodes (via appropriate provisioner)    │  │
-│   │  • Update outdated nodes (nixos-rebuild)                    │  │
-│   │  • Join new nodes to cluster (kubeadm join)                 │  │
-│   │  • Remove stale nodes (kubeadm drain/delete)                │  │
-│   │  • Install/upgrade Cozystack                                │  │
-│   └─────────────────────────────────────────────────────────────┘  │
-│                                                                      │
-│                              ↓                                       │
-│                         Loop back                                    │
-│                    (until converged)                                 │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-#### State Detection
-
-```nix
-# lib/reconciler/state.nix
-{ lib, pkgs }:
-
-{
-  # Определяем текущее состояние ноды
-  getNodeState = nodeName: nodeCfg: ''
-    STATE="unknown"
-
-    # 1. Проверяем SSH доступ
-    if ! ssh_check "${nodeCfg.ssh.host}"; then
-      STATE="unreachable"
-
-    # 2. Проверяем NixOS
-    elif ! ssh "${nodeCfg.ssh.host}" "test -f /etc/NIXOS"; then
-      STATE="not_nixos"
-
-    # 3. Проверяем kubelet
-    elif ! ssh "${nodeCfg.ssh.host}" "systemctl is-active kubelet" &>/dev/null; then
-      STATE="provisioned"  # NixOS есть, но не в кластере
-
-    # 4. Проверяем членство в кластере
-    elif ! kubectl get node "${nodeName}" &>/dev/null; then
-      STATE="orphaned"  # kubelet работает, но нода не в кластере
-
-    # 5. Проверяем Ready статус
-    elif kubectl get node "${nodeName}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' | grep -q "True"; then
-      STATE="ready"
-
-    else
-      STATE="not_ready"
-    fi
-
-    echo "$STATE"
-  '';
-
-  # Возможные состояния
-  states = {
-    unreachable = "Node not reachable via SSH";
-    not_nixos = "Not a NixOS system";
-    provisioned = "NixOS installed, not in cluster";
-    orphaned = "Kubelet running, not in cluster";
-    not_ready = "In cluster, not Ready";
-    ready = "Fully operational";
-  };
-}
-```
-
-#### Reconciliation Actions
-
-```nix
-# lib/reconciler/actions.nix
-{ lib }:
-
-{
-  # Определяем действия на основе текущего и желаемого состояния
-  determineActions = { currentState, desiredNodes, currentNodes }:
-    let
-      # Ноды которые нужно добавить
-      nodesToAdd = lib.filterAttrs (n: _:
-        !(currentNodes ? ${n}) ||
-        currentState.${n} == "unreachable" ||
-        currentState.${n} == "not_nixos"
-      ) desiredNodes;
-
-      # Ноды которые нужно присоединить к кластеру
-      nodesToJoin = lib.filterAttrs (n: _:
-        (currentState.${n} or "") == "provisioned" ||
-        (currentState.${n} or "") == "orphaned"
-      ) desiredNodes;
-
-      # Ноды которые нужно удалить
-      nodesToRemove = lib.filterAttrs (n: _:
-        !(desiredNodes ? ${n})
-      ) currentNodes;
-
-      # Ноды которые нужно обновить (config drift)
-      nodesToUpdate = lib.filterAttrs (n: v:
-        currentState.${n} == "ready" &&
-        v.configHash != currentNodes.${n}.configHash or ""
-      ) desiredNodes;
-
-    in {
-      inherit nodesToAdd nodesToJoin nodesToRemove nodesToUpdate;
-
-      # Порядок выполнения
-      order = [
-        "remove"    # Сначала удаляем лишние
-        "provision" # Затем провижним новые
-        "join"      # Присоединяем к кластеру
-        "update"    # Обновляем существующие
-      ];
-    };
-}
-```
-
-#### Reconciler Script
-
-```nix
-# apps/bootstrap/reconciler.nix
-{ pkgs, lib, clusterConfig }:
-
-let
-  # Собираем все ноды из всех provisioners
-  allNodes = lib.foldl' (acc: provName:
-    let
-      prov = clusterConfig.provisioners.${provName} or {};
-      nodes = prov.nodes or {};
-      # Добавляем provisioner к каждой ноде
-      nodesWithProv = lib.mapAttrs (n: v: v // {
-        provisioner = provName;
-        role = resolveRole clusterConfig.nodeConfigurations v.configuration;
-      }) nodes;
-    in acc // nodesWithProv
-  ) {} (builtins.attrNames (clusterConfig.provisioners or {}));
-
-  resolveRole = nodeConfigs: configName:
-    let
-      resolve = name:
-        let cfg = nodeConfigs.${name}; in
-        if cfg ? role then cfg.role
-        else if cfg ? extends then resolve cfg.extends
-        else throw "No role in configuration chain: ${configName}";
-    in resolve configName;
-
-in pkgs.writeShellApplication {
-  name = "reconcile-cluster";
-
-  runtimeInputs = with pkgs; [ openssh kubectl jq ];
-
-  text = ''
-    set -euo pipefail
-
-    log() { echo "[$(date '+%H:%M:%S')] $*"; }
-
-    # ═══════════════════════════════════════════════════════════════
-    # Phase 1: Collect current state
-    # ═══════════════════════════════════════════════════════════════
-    log "Collecting cluster state..."
-
-    declare -A CURRENT_STATE
-    declare -A DESIRED_NODES
-
-    # Load desired nodes
-    ${lib.concatMapStrings (name: ''
-      DESIRED_NODES[${name}]="${allNodes.${name}.provisioner}:${allNodes.${name}.role}"
-    '') (builtins.attrNames allNodes)}
-
-    # Check current state of each node
-    for node in "''${!DESIRED_NODES[@]}"; do
-      state=$(get_node_state "$node")
-      CURRENT_STATE[$node]="$state"
-      log "  $node: $state"
-    done
-
-    # ═══════════════════════════════════════════════════════════════
-    # Phase 2: Determine actions
-    # ═══════════════════════════════════════════════════════════════
-    log "Planning actions..."
-
-    NODES_TO_PROVISION=()
-    NODES_TO_JOIN=()
-    NODES_TO_UPDATE=()
-
-    for node in "''${!DESIRED_NODES[@]}"; do
-      state="''${CURRENT_STATE[$node]}"
-      case "$state" in
-        unreachable|not_nixos)
-          NODES_TO_PROVISION+=("$node")
-          ;;
-        provisioned|orphaned)
-          NODES_TO_JOIN+=("$node")
-          ;;
-        not_ready|ready)
-          # Check for config drift
-          if needs_update "$node"; then
-            NODES_TO_UPDATE+=("$node")
-          fi
-          ;;
-      esac
-    done
-
-    log "  To provision: ''${NODES_TO_PROVISION[*]:-none}"
-    log "  To join: ''${NODES_TO_JOIN[*]:-none}"
-    log "  To update: ''${NODES_TO_UPDATE[*]:-none}"
-
-    # ═══════════════════════════════════════════════════════════════
-    # Phase 3: Execute actions
-    # ═══════════════════════════════════════════════════════════════
-
-    # Provision nodes (group by provisioner)
-    if [[ ''${#NODES_TO_PROVISION[@]} -gt 0 ]]; then
-      log "Provisioning nodes..."
-
-      ${lib.concatMapStrings (provName: ''
-        # Nodes for ${provName}
-        ${provName}_nodes=()
-        for node in "''${NODES_TO_PROVISION[@]}"; do
-          if [[ "''${DESIRED_NODES[$node]%%:*}" == "${provName}" ]]; then
-            ${provName}_nodes+=("$node")
-          fi
-        done
-
-        if [[ ''${#${provName}_nodes[@]} -gt 0 ]]; then
-          log "  Running ${provName} provisioner..."
-          provision_${provName} "''${${provName}_nodes[@]}"
-        fi
-      '') (builtins.attrNames (clusterConfig.provisioners or {}))}
-    fi
-
-    # Join nodes to cluster
-    if [[ ''${#NODES_TO_JOIN[@]} -gt 0 ]]; then
-      log "Joining nodes to cluster..."
-
-      # Separate control-planes and workers
-      CP_NODES=()
-      WORKER_NODES=()
-
-      for node in "''${NODES_TO_JOIN[@]}"; do
-        role="''${DESIRED_NODES[$node]#*:}"
-        if [[ "$role" == "control-plane" ]]; then
-          CP_NODES+=("$node")
-        else
-          WORKER_NODES+=("$node")
-        fi
-      done
-
-      # Join control-planes first
-      for node in "''${CP_NODES[@]}"; do
-        kubeadm_join_cp "$node"
-      done
-
-      # Then workers (can be parallel)
-      for node in "''${WORKER_NODES[@]}"; do
-        kubeadm_join_worker "$node" &
-      done
-      wait
-    fi
-
-    # Update nodes
-    if [[ ''${#NODES_TO_UPDATE[@]} -gt 0 ]]; then
-      log "Updating nodes..."
-      for node in "''${NODES_TO_UPDATE[@]}"; do
-        nixos_rebuild "$node"
-      done
-    fi
-
-    # ═══════════════════════════════════════════════════════════════
-    # Phase 4: Verify convergence
-    # ═══════════════════════════════════════════════════════════════
-    log "Verifying cluster state..."
-
-    all_ready=true
-    for node in "''${!DESIRED_NODES[@]}"; do
-      if ! kubectl get node "$node" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' | grep -q "True"; then
-        log "  WARNING: $node is not Ready"
-        all_ready=false
-      fi
-    done
-
-    if $all_ready; then
-      log "✓ Cluster converged successfully"
-    else
-      log "⚠ Some nodes are not ready, may need another reconcile cycle"
-      exit 1
-    fi
-  '';
-}
-```
-
-#### Idempotency
-
-Reconciler обеспечивает идемпотентность:
-
-| Текущее состояние | Действие | Результат |
-|-------------------|----------|-----------|
-| Node не существует | Provision → Join | Node ready |
-| Node unreachable | Re-provision → Join | Node ready |
-| Node provisioned | Join | Node ready |
-| Node ready, config same | Skip | Node ready |
-| Node ready, config changed | Update | Node ready |
-| Node not in config | Drain → Delete | Node removed |
-
-### 3.9 State Directory Structure
-
-Каждый reconciler владеет своей директорией в `$STATE_DIR`:
-
-```
-$STATE_DIR/
-│
-├── nodes/                          # Provisioners пишут сюда
-│   ├── cp1/
-│   │   └── config.json             # Provisioner создал ноду
-│   ├── worker1/
-│   │   └── config.json
-│   └── worker2/
-│       └── config.json
-│
-├── k8s/                            # k8s-joiner владеет
-│   ├── initialized                 # Кластер создан
-│   ├── kubeconfig                  # Admin kubeconfig
-│   ├── join-token
-│   ├── ca-hash
-│   └── members/                    # Ноды в кластере
-│       ├── cp1
-│       ├── worker1
-│       └── worker2
-│
-├── cozystack/                      # cozystack reconciler владеет
-│   ├── installed
-│   └── version
-│
-└── pids/                           # PID файлы reconcilers
-    ├── nixos-anywhere.pid
-    ├── k8s-joiner.pid
-    └── cozystack.pid
-```
-
-#### Принцип ownership
-
-Каждый reconciler:
-- **Читает** директории других reconcilers (readonly)
-- **Пишет** только в свою директорию
-
-| Reconciler | Владеет | Читает |
-|------------|---------|--------|
-| nixos-anywhere | `nodes/<name>/` | — |
-| pxe | `nodes/<name>/` | — |
-| k8s-joiner | `k8s/` | `nodes/` |
-| cozystack | `cozystack/` | `k8s/kubeconfig` |
-
-#### Node config.json
-
-Provisioner создаёт минимальный `config.json`:
-
-```json
-{
-  "ip": "10.0.0.10",
-  "role": "control-plane"
-}
-```
-
-Для PXE-discovered нод:
-
-```json
-{
-  "ip": "10.0.0.50",
-  "role": "worker",
-  "mac": "aa:bb:cc:dd:ee:ff",
-  "discovered": true
-}
-```
-
-#### k8s-joiner логика
-
-```bash
-# Найти ноды которые нужно добавить в кластер
-for node_dir in "$STATE_DIR/nodes"/*/; do
-  node=$(basename "$node_dir")
-
-  # Уже в кластере?
-  [[ -f "$STATE_DIR/k8s/members/$node" ]] && continue
-
-  # Нода есть, но не в кластере → join
-  join_node "$node"
-  touch "$STATE_DIR/k8s/members/$node"
-done
-
-# Найти ноды которые удалены из конфига
-for member in "$STATE_DIR/k8s/members"/*; do
-  node=$(basename "$member")
-
-  # Нода удалена из nodes/?
-  if [[ ! -d "$STATE_DIR/nodes/$node" ]]; then
-    drain_and_delete "$node"
-    rm "$STATE_DIR/k8s/members/$node"
-  fi
-done
-```
-
-### 3.10 Node Lifecycle
-
-```
-                              ┌──────────────────────────────┐
-                              │      Config (desired)        │
-                              │  provisioners.*.nodes.*      │
-                              └──────────────┬───────────────┘
-                                             │
-          ┌──────────────────────────────────┼──────────────────────────────────┐
-          │                                  │                                  │
-          ▼                                  ▼                                  ▼
-   ┌─────────────┐                    ┌─────────────┐                    ┌─────────────┐
-   │   Явная     │                    │  Discovery  │                    │  Terraform  │
-   │   нода      │                    │  (PXE boot) │                    │  (create)   │
-   └──────┬──────┘                    └──────┬──────┘                    └──────┬──────┘
-          │                                  │                                  │
-          │                                  │ callback                         │
-          │                                  ▼                                  │
-          │                           ┌─────────────┐                           │
-          │                           │ discovered  │                           │
-          │                           │ (pending)   │                           │
-          │                           └──────┬──────┘                           │
-          │                                  │                                  │
-          └──────────────────┬───────────────┴──────────────────────────────────┘
-                             │
-                             ▼
-                      ┌─────────────┐
-                      │ provisioned │  ← NixOS installed, not in k8s
-                      └──────┬──────┘
-                             │
-                             │ kubeadm join
-                             ▼
-                      ┌─────────────┐
-                      │   joined    │  ← In cluster, maybe NotReady
-                      └──────┬──────┘
-                             │
-                             │ node Ready
-                             ▼
-          ┌─────────────────────────────────────────────────┐
-          │                    ready                         │
-          │                                                  │
-          │  ┌─────────────────────────────────────────┐    │
-          │  │  Config changed?                        │    │
-          │  │    → nixos-rebuild                      │    │
-          │  │    → update config-hash                 │    │
-          │  └─────────────────────────────────────────┘    │
-          │                                                  │
-          │  ┌─────────────────────────────────────────┐    │
-          │  │  Heartbeat (discovered nodes)           │    │
-          │  │    → update lastSeen                    │    │
-          │  │    → TTL expired? → mark stale          │    │
-          │  └─────────────────────────────────────────┘    │
-          │                                                  │
-          └──────────────────────┬──────────────────────────┘
-                                 │
-                                 │ remove from config
-                                 │ OR TTL expired
-                                 │ OR manual delete
-                                 ▼
-                          ┌─────────────┐
-                          │  draining   │  ← kubectl drain
-                          └──────┬──────┘
-                                 │
-                                 │ drained
-                                 ▼
-                          ┌─────────────┐
-                          │  deleting   │  ← kubectl delete node
-                          └──────┬──────┘
-                                 │
-                                 │ rm -rf $STATE_DIR/nodes/$name
-                                 ▼
-                          ┌─────────────┐
-                          │   (gone)    │
-                          └─────────────┘
-```
-
-### 3.11 Node Operations
-
-#### Update (config changed)
-
-```bash
-# Reconciler detects config drift
-current_hash=$(cat "$STATE_DIR/nodes/$name/config-hash")
-desired_hash=$(nix eval --raw ".#nixosConfigurations.$name.config.system.build.toplevel.outPath" | sha256sum)
-
-if [[ "$current_hash" != "$desired_hash" ]]; then
-  # Rebuild
-  ssh "$node_ip" "nixos-rebuild switch --flake .#$name"
-
-  # Update hash
-  echo "$desired_hash" > "$STATE_DIR/nodes/$name/config-hash"
-
-  # Update state
-  jq '.status = "ready" | .timestamps.updated = now' \
-    "$STATE_DIR/nodes/$name/state.json" > tmp && mv tmp "$STATE_DIR/nodes/$name/state.json"
-fi
-```
-
-#### Delete (explicit)
-
-```bash
-# CLI command
-nix run .#node-delete -- worker-old
-
-# Or create marker file
-touch "$STATE_DIR/nodes/worker-old/DELETE"
-
-# Reconciler sees marker and:
-# 1. kubectl drain worker-old --ignore-daemonsets --delete-emptydir-data
-# 2. kubectl delete node worker-old
-# 3. rm -rf "$STATE_DIR/nodes/worker-old"
-```
-
-#### Delete (TTL expired for discovered nodes)
-
-```nix
-provisioners.pxe = {
-  discovery = {
-    # TTL для discovered нод
-    ttl = 3600;  # 1 hour
-
-    # Или heartbeat
-    heartbeat = {
-      interval = 60;    # Node должна пинговать каждые 60 сек
-      timeout = 300;    # После 5 минут без heartbeat — stale
-    };
-  };
-};
-```
-
-```bash
-# Reconciler checks TTL
-for node_dir in "$STATE_DIR/nodes/"*/; do
-  state="$node_dir/state.json"
-
-  if jq -e '.discovered' "$state" &>/dev/null; then
-    last_seen=$(jq -r '.timestamps.lastSeen' "$state")
-    ttl=$(( $(date +%s) - $(date -d "$last_seen" +%s) ))
-
-    if [[ $ttl -gt $MAX_TTL ]]; then
-      log "Node $(basename "$node_dir") TTL expired, marking for deletion"
-      touch "$node_dir/DELETE"
-    fi
-  fi
-done
-```
-
-#### Force rebuild
-
-```bash
-# CLI command
-nix run .#node-rebuild -- worker1
-
-# Implementation: remove config-hash
-rm "$STATE_DIR/nodes/worker1/config-hash"
-
-# Reconciler sees missing hash → triggers rebuild
-```
-
-### 3.12 Reconciler Configuration
-
-```nix
-reconciler = {
-  # Polling interval (if not event-driven)
-  interval = 30;  # seconds
-
-  # Update strategy
-  update = {
-    strategy = "rolling";  # or "parallel"
-    maxUnavailable = 1;    # for rolling
-
-    healthCheck = {
-      wait = 60;  # seconds after rebuild
-      retries = 3;
-    };
-  };
-
-  # Discovery settings
-  discovery = {
-    ttl = 3600;  # 1 hour for discovered nodes
-
-    # Auto-assign configuration based on hardware
-    autoConfiguration = {
-      rules = [
-        {
-          match.hardware.gpu = true;
-          assign = "worker-gpu";
-        }
-        {
-          match.hardware.memoryGb = ">= 128";
-          assign = "worker-storage";
-        }
-        {
-          assign = "worker-standard";  # default
-        }
-      ];
-    };
-  };
-
-  # Hooks
-  hooks = {
-    preProvision = [ ];
-    postProvision = [ ];
-    preJoin = [ ];
-    postJoin = [ ];
-    preDrain = [ ];
-    postDelete = [ ];
-  };
-};
-```
-
----
-
-## 4. Node Extensions System
-
-### 4.1 Extension Interface
-
-```nix
-# modules/node/extensions/interface.nix
-{ lib, ... }:
-
-{
-  options.cozystack.extensions = {
-    drbd = {
-      enable = lib.mkEnableOption "DRBD storage replication";
-    };
-
-    gpu = {
-      enable = lib.mkEnableOption "GPU support";
-      vendor = lib.mkOption {
-        type = lib.types.enum [ "nvidia" "amd" ];
-        default = "nvidia";
-        description = "GPU vendor";
-      };
-    };
-
-    storage = {
-      enable = lib.mkEnableOption "local storage management";
-    };
-
-    monitoring = {
-      enable = lib.mkEnableOption "node monitoring";
-      nodeExporter = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description = "Enable Prometheus node exporter";
-      };
-    };
-  };
-}
-```
-
-### 4.2 DRBD Extension Example
-
-```nix
-# modules/node/extensions/drbd.nix
-{ config, lib, pkgs, ... }:
-
-lib.mkIf config.cozystack.extensions.drbd.enable {
-  boot.kernelModules = [ "drbd" ];
-
-  boot.extraModulePackages = with config.boot.kernelPackages; [
-    drbd
-  ];
-
-  environment.systemPackages = with pkgs; [
-    drbd
-    linstor-server
-    linstor-client
-  ];
-
-  # LINSTOR for DRBD management
-  services.linstor = {
-    enable = true;
-  };
-}
-```
-
-### 4.3 GPU Extension Example
-
-```nix
-# modules/node/extensions/gpu.nix
-{ config, lib, pkgs, ... }:
-
-let
-  cfg = config.cozystack.extensions.gpu;
-in
-lib.mkIf cfg.enable {
-  # GPU drivers based on vendor
-  services.xserver.videoDrivers = [ cfg.vendor ];
-
-  hardware.graphics = {
-    enable = true;
-    enable32Bit = true;
-  };
-
-  hardware.nvidia = lib.mkIf (cfg.vendor == "nvidia") {
-    package = config.boot.kernelPackages.nvidiaPackages.stable;
-    modesetting.enable = true;
-  };
-
-  # Container runtime GPU support (NVIDIA)
-  virtualisation.containerd.settings = lib.mkIf (cfg.vendor == "nvidia") {
-    plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia = {
-      runtime_type = "io.containerd.runc.v2";
-      options.BinaryName = "${pkgs.nvidia-container-toolkit}/bin/nvidia-container-runtime";
-    };
+  provisioning.lima = {
+    cpus = 2;
+    memory = "4GiB";
+    disk = "30GiB";
+    network = "192.168.105.0/24";
   };
 }
 ```
 
 ---
 
-## 5. Disko Integration (Declarative Disk Partitioning)
+## 6. Extensions System
 
-### 5.1 Overview
+### 6.1 Auto-Import Architecture
 
-Disko обеспечивает декларативную разметку дисков для nixos-anywhere. Система спроектирована с учётом:
-
-- **Базовые профили** — готовые схемы разметки для типичных сценариев
-- **Per-node overrides** — возможность переопределить любой аспект через NixOS модули
-- **Composability** — профили можно комбинировать и расширять
-
-### 5.2 Module Structure
+All extension modules are automatically imported into every node's NixOS configuration. User just enables what's needed via `extensions.<name>.enable = true`.
 
 ```
-modules/
-├── disko/
-│   ├── default.nix           # Main disko module with options
-│   ├── profiles/
-│   │   ├── simple.nix        # Single disk, basic layout
-│   │   ├── lvm.nix           # LVM-based layout
-│   │   ├── zfs.nix           # ZFS with datasets
-│   │   ├── raid.nix          # Software RAID
-│   │   └── etcd-optimized.nix # Separate NVMe for etcd
-│   └── lib.nix               # Helper functions
+┌─────────────────────────────────────────────────────────────────┐
+│                    Extension Registry                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  modules/extensions/                                            │
+│  ├── nvidia.nix      →  nix8s.extensions.nvidia.*              │
+│  ├── drbd.nix        →  nix8s.extensions.drbd.*                │
+│  ├── zfs.nix         →  nix8s.extensions.zfs.*                 │
+│  ├── monitoring.nix  →  nix8s.extensions.monitoring.*          │
+│  └── ...                                                        │
+│                                                                  │
+│  All modules auto-imported, activated via `enable = true`       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.3 Base Disko Module
+### 6.2 Extension Interface
 
 ```nix
-# modules/disko/default.nix
+# modules/extensions/nvidia.nix
 { config, lib, pkgs, ... }:
 
 let
-  cfg = config.cozystack.disko;
+  cfg = config.nix8s.extensions.nvidia;
 in
 {
-  options.cozystack.disko = {
-    enable = lib.mkEnableOption "declarative disk partitioning";
+  options.nix8s.extensions.nvidia = {
+    enable = lib.mkEnableOption "NVIDIA GPU support";
 
-    profile = lib.mkOption {
-      type = lib.types.enum [ "simple" "lvm" "zfs" "raid" "etcd-optimized" "custom" ];
-      default = "simple";
-      description = "Disk layout profile to use";
+    package = lib.mkOption {
+      type = lib.types.enum ["stable" "beta" "production"];
+      default = "stable";
     };
 
-    disks = {
-      main = lib.mkOption {
-        type = lib.types.str;
-        example = "/dev/sda";
-        description = "Primary disk device";
-      };
-
-      etcd = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
-        default = null;
-        example = "/dev/nvme0n1";
-        description = "Dedicated disk for etcd (control-plane only)";
-      };
-
-      data = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        default = [];
-        example = [ "/dev/sdb" "/dev/sdc" ];
-        description = "Additional data disks";
-      };
-    };
-
-    # Размеры партиций
-    partitions = {
-      boot = lib.mkOption {
-        type = lib.types.str;
-        default = "512M";
-        description = "Boot partition size";
-      };
-
-      swap = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
-        default = "8G";
-        description = "Swap partition size (null to disable)";
-      };
-
-      root = lib.mkOption {
-        type = lib.types.str;
-        default = "100%";
-        description = "Root partition size";
-      };
-    };
-
-    # Filesystem options
-    filesystems = {
-      root = {
-        type = lib.mkOption {
-          type = lib.types.enum [ "ext4" "xfs" "btrfs" "zfs" ];
-          default = "ext4";
-          description = "Root filesystem type";
-        };
-
-        options = lib.mkOption {
-          type = lib.types.listOf lib.types.str;
-          default = [ "noatime" ];
-          description = "Mount options for root filesystem";
-        };
-      };
-    };
-
-    # Encryption
-    encryption = {
-      enable = lib.mkEnableOption "LUKS encryption";
-
-      keyFile = lib.mkOption {
-        type = lib.types.nullOr lib.types.path;
-        default = null;
-        description = "Path to encryption key file (for automated unlock)";
-      };
-    };
-
-    # Raw disko config for full control
-    rawConfig = lib.mkOption {
-      type = lib.types.nullOr lib.types.attrs;
-      default = null;
-      description = "Raw disko configuration (overrides profile)";
+    containerRuntime = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Enable NVIDIA container runtime for Kubernetes";
     };
   };
 
   config = lib.mkIf cfg.enable {
-    # Import disko module
-    imports = [ inputs.disko.nixosModules.disko ];
+    hardware.nvidia = {
+      package = config.boot.kernelPackages.nvidiaPackages.${cfg.package};
+      modesetting.enable = true;
+    };
 
-    # Apply profile or raw config
-    disko.devices =
-      if cfg.rawConfig != null then cfg.rawConfig
-      else import ./profiles/${cfg.profile}.nix { inherit lib cfg; };
-  };
-}
-```
+    hardware.graphics.enable = true;
 
-### 5.4 Disko Profiles
-
-#### Simple Profile (Single Disk, GPT + EFI)
-
-```nix
-# modules/disko/profiles/simple.nix
-{ lib, cfg }:
-
-{
-  disk = {
-    main = {
-      type = "disk";
-      device = cfg.disks.main;
-      content = {
-        type = "gpt";
-        partitions = {
-          ESP = {
-            size = cfg.partitions.boot;
-            type = "EF00";
-            content = {
-              type = "filesystem";
-              format = "vfat";
-              mountpoint = "/boot";
-            };
-          };
-
-          swap = lib.mkIf (cfg.partitions.swap != null) {
-            size = cfg.partitions.swap;
-            content = {
-              type = "swap";
-              randomEncryption = true;
-            };
-          };
-
-          root = {
-            size = cfg.partitions.root;
-            content = {
-              type = "filesystem";
-              format = cfg.filesystems.root.type;
-              mountpoint = "/";
-              mountOptions = cfg.filesystems.root.options;
-            };
-          };
-        };
+    virtualisation.containerd.settings = lib.mkIf cfg.containerRuntime {
+      plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia = {
+        runtime_type = "io.containerd.runc.v2";
+        options.BinaryName = "${pkgs.nvidia-container-toolkit}/bin/nvidia-container-runtime";
       };
     };
   };
-}
-```
-
-#### LVM Profile (Flexible Volume Management)
-
-```nix
-# modules/disko/profiles/lvm.nix
-{ lib, cfg }:
-
-{
-  disk = {
-    main = {
-      type = "disk";
-      device = cfg.disks.main;
-      content = {
-        type = "gpt";
-        partitions = {
-          ESP = {
-            size = cfg.partitions.boot;
-            type = "EF00";
-            content = {
-              type = "filesystem";
-              format = "vfat";
-              mountpoint = "/boot";
-            };
-          };
-
-          lvm = {
-            size = "100%";
-            content = {
-              type = "lvm_pv";
-              vg = "vg0";
-            };
-          };
-        };
-      };
-    };
-  };
-
-  lvm_vg = {
-    vg0 = {
-      type = "lvm_vg";
-      lvs = {
-        swap = lib.mkIf (cfg.partitions.swap != null) {
-          size = cfg.partitions.swap;
-          content = {
-            type = "swap";
-          };
-        };
-
-        root = {
-          size = "50G";
-          content = {
-            type = "filesystem";
-            format = cfg.filesystems.root.type;
-            mountpoint = "/";
-            mountOptions = cfg.filesystems.root.options;
-          };
-        };
-
-        var = {
-          size = "100%FREE";
-          content = {
-            type = "filesystem";
-            format = "xfs";
-            mountpoint = "/var";
-            mountOptions = [ "noatime" ];
-          };
-        };
-      };
-    };
-  };
-}
-```
-
-#### etcd-optimized Profile (Separate NVMe for etcd)
-
-```nix
-# modules/disko/profiles/etcd-optimized.nix
-{ lib, cfg }:
-
-{
-  disk = {
-    main = {
-      type = "disk";
-      device = cfg.disks.main;
-      content = {
-        type = "gpt";
-        partitions = {
-          ESP = {
-            size = cfg.partitions.boot;
-            type = "EF00";
-            content = {
-              type = "filesystem";
-              format = "vfat";
-              mountpoint = "/boot";
-            };
-          };
-
-          root = {
-            size = "100%";
-            content = {
-              type = "filesystem";
-              format = cfg.filesystems.root.type;
-              mountpoint = "/";
-              mountOptions = cfg.filesystems.root.options;
-            };
-          };
-        };
-      };
-    };
-
-    # Dedicated etcd disk - optimized for low latency
-    etcd = lib.mkIf (cfg.disks.etcd != null) {
-      type = "disk";
-      device = cfg.disks.etcd;
-      content = {
-        type = "gpt";
-        partitions = {
-          etcd = {
-            size = "100%";
-            content = {
-              type = "filesystem";
-              format = "xfs";
-              mountpoint = "/var/lib/etcd";
-              # Optimized for etcd: no access time, direct I/O friendly
-              mountOptions = [
-                "noatime"
-                "nodiratime"
-                "nobarrier"  # NVMe doesn't need barriers
-              ];
-            };
-          };
-        };
-      };
-    };
-  };
-}
-```
-
-### 5.5 Per-Node Configuration with Module Overrides
-
-Ключевая возможность — каждая нода может подключать свои NixOS модули через `provisioners.*.nodes.*`:
-
-```nix
-# Cluster configuration (flake.nix или отдельный файл)
-{
-  clusterConfig = {
-    # nodeConfigurations определяют ЧТО деплоить (см. секцию 3.3)
-    nodeConfigurations = {
-      control-plane-nvme = {
-        extends = "control-plane";
-        disko.profile = "etcd-optimized";
-      };
-      worker-storage = {
-        extends = "worker";
-        disko.profile = "lvm";
-        extensions.drbd.enable = true;
-      };
-      worker-gpu = {
-        extends = "worker";
-        extensions.gpu.enable = true;
-      };
-    };
-
-    # provisioners определяют КАК и КУДА деплоить
-    provisioners.nixos-anywhere = {
-      defaults.ssh = {
-        user = "root";
-        keyFile = ./keys/deploy;
-      };
-
-      nodes = {
-        cp1 = {
-          configuration = "control-plane-nvme";
-          ip = "192.168.1.10";
-          ssh.host = "192.168.1.10";
-          disko.disks = {
-            main = "/dev/sda";
-            etcd = "/dev/nvme0n1";
-          };
-
-          # Node-specific NixOS modules (override anything)
-          modules = [
-            # Inline module
-            ({ config, ... }: {
-              # Override disko partition sizes
-              cozystack.disko.partitions.swap = "16G";
-
-              # Add custom mounts
-              fileSystems."/data" = {
-                device = "/dev/sdb1";
-                fsType = "xfs";
-              };
-            })
-
-            # External module file
-            ./nodes/cp1/hardware.nix
-            ./nodes/cp1/network.nix
-          ];
-        };
-
-        cp2 = {
-          configuration = "control-plane-nvme";
-          ip = "192.168.1.11";
-          ssh.host = "192.168.1.11";
-          disko.disks = {
-            main = "/dev/sda";
-            etcd = "/dev/nvme0n1";
-          };
-
-          # Different hardware - different modules
-          modules = [
-            ./nodes/cp2/hardware.nix
-          ];
-        };
-
-        worker1 = {
-          configuration = "worker-storage";
-          ip = "192.168.1.20";
-          ssh.host = "192.168.1.20";
-
-          # Worker with RAID and custom disko
-          disko = {
-            profile = "custom";
-            rawConfig = {
-              # Full control over disko config
-              disk = {
-                sda = { /* ... */ };
-                sdb = { /* ... */ };
-              };
-              mdadm = {
-                md0 = { /* ... */ };
-              };
-            };
-          };
-
-          modules = [
-            ./nodes/worker1/storage.nix
-          ];
-        };
-
-        # Worker with GPU
-        worker-gpu-01 = {
-          configuration = "worker-gpu";
-          ip = "192.168.1.21";
-          ssh.host = "192.168.1.21";
-          disko.disks.main = "/dev/nvme0n1";
-
-          # Override GPU settings for this specific node
-          extensions.gpu.vendor = "nvidia";
-
-          modules = [
-            ./nodes/worker-gpu/nvidia.nix
-          ];
-        };
-      };
-    };
-  };
-}
-```
-
-### 5.6 Node Module Generation
-
-```nix
-# lib/mkNodeConfig.nix
-{ lib, inputs, clusterConfig }:
-
-nodeName: nodeCfg:
-
-let
-  # Resolve configuration with inheritance (see Section 3.6)
-  resolveConfig = name:
-    let
-      cfg = clusterConfig.nodeConfigurations.${name};
-      parent = if cfg ? extends
-        then resolveConfig cfg.extends
-        else {};
-    in
-      lib.recursiveUpdate parent (builtins.removeAttrs cfg [ "extends" ]);
-
-  # Get resolved configuration for this node
-  resolvedConfig = resolveConfig nodeCfg.configuration;
-  nodeRole = resolvedConfig.role or (throw "No role for ${nodeCfg.configuration}");
-
-  # Base modules for all nodes
-  baseModules = [
-    inputs.disko.nixosModules.disko
-    ../modules/node/default.nix
-    ../modules/disko/default.nix
-  ];
-
-  # Role-specific modules
-  roleModules = {
-    "control-plane" = [ ../modules/node/control-plane.nix ];
-    "worker" = [ ../modules/node/worker.nix ];
-  };
-
-  # Merge disko config: nodeConfiguration + node-specific overrides
-  diskoModule = { config, ... }: {
-    cozystack.disko = {
-      enable = true;
-    } // (resolvedConfig.disko or {}) // (nodeCfg.disko or {});
-  };
-
-  # Extensions from nodeConfiguration + node-specific overrides
-  extensionsModule = { ... }: {
-    cozystack.extensions = lib.recursiveUpdate
-      (resolvedConfig.extensions or {})
-      (nodeCfg.extensions or {});
-  };
-
-  # Node identity module
-  identityModule = { ... }: {
-    networking.hostName = nodeName;
-    networking.interfaces.eth0.ipv4.addresses = [{
-      address = nodeCfg.ip;
-      prefixLength = 24;
-    }];
-  };
-
-in {
-  imports = lib.flatten [
-    baseModules
-    (roleModules.${nodeRole} or [])
-    [ diskoModule extensionsModule identityModule ]
-    (resolvedConfig.modules or [])  # Modules from nodeConfiguration
-    (nodeCfg.modules or [])         # Node-specific modules (highest priority)
-  ];
-}
-```
-
-### 5.7 Example: Custom Node Hardware Configuration
-
-```nix
-# nodes/cp1/hardware.nix
-# Specific hardware configuration for cp1
-
-{ config, lib, pkgs, modulesPath, ... }:
-
-{
-  imports = [
-    (modulesPath + "/installer/scan/not-detected.nix")
-  ];
-
-  # Override boot settings for specific hardware
-  boot.initrd.availableKernelModules = [
-    "xhci_pci" "ahci" "nvme" "usbhid" "usb_storage" "sd_mod"
-  ];
-  boot.kernelModules = [ "kvm-intel" ];
-
-  # Intel CPU microcode
-  hardware.cpu.intel.updateMicrocode = true;
-
-  # Override disko for this specific node
-  cozystack.disko = {
-    partitions = {
-      boot = "1G";      # Larger boot for multiple kernels
-      swap = "32G";     # More swap for etcd
-    };
-
-    filesystems.root = {
-      type = "xfs";     # XFS instead of default ext4
-      options = [ "noatime" "logbufs=8" "logbsize=256k" ];
-    };
-  };
-
-  # Additional mounts specific to this node
-  fileSystems."/var/log" = {
-    device = "/dev/disk/by-label/logs";
-    fsType = "xfs";
-    options = [ "noatime" ];
-  };
-}
-```
-
-### 5.8 Example: Custom Network Configuration
-
-```nix
-# nodes/cp1/network.nix
-# Custom networking for cp1 (bonding, VLANs)
-
-{ config, lib, ... }:
-
-{
-  # Override default network config
-  networking = {
-    useDHCP = false;
-
-    # Bonding for redundancy
-    bonds.bond0 = {
-      interfaces = [ "eth0" "eth1" ];
-      driverOptions = {
-        mode = "802.3ad";
-        miimon = "100";
-        lacp_rate = "fast";
-      };
-    };
-
-    # VLANs
-    vlans = {
-      vlan100 = { id = 100; interface = "bond0"; };  # Management
-      vlan200 = { id = 200; interface = "bond0"; };  # Storage
-    };
-
-    interfaces = {
-      bond0.useDHCP = false;
-
-      vlan100.ipv4.addresses = [{
-        address = "192.168.100.10";
-        prefixLength = 24;
-      }];
-
-      vlan200.ipv4.addresses = [{
-        address = "10.0.200.10";
-        prefixLength = 24;
-      }];
-    };
-
-    defaultGateway = "192.168.100.1";
-  };
-
-  # Override the node IP for kubernetes
-  # (use management VLAN IP)
-  cozystack.node.ip = "192.168.100.10";
-}
-```
-
-### 5.9 Module Priority and Merge Strategy
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Final Node Configuration                  │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  ┌─────────────────┐                                        │
-│  │ User modules    │  ← Highest priority (nodeCfg.modules)  │
-│  │ (per-node)      │    Can override EVERYTHING             │
-│  └────────┬────────┘                                        │
-│           │ lib.mkForce / lib.mkOverride                    │
-│           ▼                                                  │
-│  ┌─────────────────┐                                        │
-│  │ Disko module    │  ← Disk configuration                  │
-│  │ (from profile)  │                                        │
-│  └────────┬────────┘                                        │
-│           │                                                  │
-│           ▼                                                  │
-│  ┌─────────────────┐                                        │
-│  │ Role modules    │  ← control-plane.nix / worker.nix     │
-│  │                 │                                        │
-│  └────────┬────────┘                                        │
-│           │                                                  │
-│           ▼                                                  │
-│  ┌─────────────────┐                                        │
-│  │ Base modules    │  ← Lowest priority (default.nix)      │
-│  │                 │    Kubernetes base, containerd, etc.  │
-│  └─────────────────┘                                        │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 5.10 Full Node Configuration Example
-
-```nix
-# examples/ha/nodes/cp1.nix
-# Complete configuration for production control-plane node
-
-{ config, lib, pkgs, ... }:
-
-{
-  # ═══════════════════════════════════════════════════════════
-  # Disk Layout (override disko profile)
-  # ═══════════════════════════════════════════════════════════
-
-  cozystack.disko = {
-    profile = "lvm";
-
-    disks = {
-      main = "/dev/sda";
-      etcd = "/dev/nvme0n1";
-      data = [ "/dev/sdb" ];
-    };
-
-    partitions = {
-      boot = "1G";
-      swap = "32G";
-    };
-
-    encryption = {
-      enable = true;
-      keyFile = config.sops.secrets."disk-encryption-key".path;
-    };
-  };
-
-  # ═══════════════════════════════════════════════════════════
-  # Hardware-specific
-  # ═══════════════════════════════════════════════════════════
-
-  boot.kernelModules = [ "kvm-intel" "vfio-pci" ];
-  hardware.cpu.intel.updateMicrocode = true;
-
-  # Disable C-states for lower latency (etcd)
-  boot.kernelParams = [
-    "intel_idle.max_cstate=1"
-    "processor.max_cstate=1"
-    "idle=poll"  # Aggressive, use with caution
-  ];
-
-  # ═══════════════════════════════════════════════════════════
-  # Networking (bonding + VLANs)
-  # ═══════════════════════════════════════════════════════════
-
-  networking = {
-    hostName = "cp1";
-
-    bonds.bond0 = {
-      interfaces = [ "enp1s0f0" "enp1s0f1" ];
-      driverOptions.mode = "802.3ad";
-    };
-
-    vlans = {
-      management = { id = 100; interface = "bond0"; };
-      storage = { id = 200; interface = "bond0"; };
-      kubernetes = { id = 300; interface = "bond0"; };
-    };
-
-    interfaces = {
-      management.ipv4.addresses = [{ address = "10.0.100.10"; prefixLength = 24; }];
-      storage.ipv4.addresses = [{ address = "10.0.200.10"; prefixLength = 24; }];
-      kubernetes.ipv4.addresses = [{ address = "10.0.300.10"; prefixLength = 24; }];
-    };
-  };
-
-  # ═══════════════════════════════════════════════════════════
-  # Secrets (sops-nix)
-  # ═══════════════════════════════════════════════════════════
-
-  sops = {
-    defaultSopsFile = ../../../secrets/cp1.yaml;
-    age.keyFile = "/var/lib/sops-nix/key.txt";
-
-    secrets = {
-      "disk-encryption-key" = {};
-      "etcd-peer-cert" = {};
-      "etcd-peer-key" = {};
-    };
-  };
-
-  # ═══════════════════════════════════════════════════════════
-  # Extensions
-  # ═══════════════════════════════════════════════════════════
-
-  cozystack.extensions = {
-    drbd.enable = true;
-    monitoring = {
-      enable = true;
-      nodeExporter = true;
-    };
-  };
-
-  # ═══════════════════════════════════════════════════════════
-  # Custom services for this node
-  # ═══════════════════════════════════════════════════════════
-
-  services.smartd.enable = true;
-  services.fstrim.enable = true;
-
-  # Additional packages
-  environment.systemPackages = with pkgs; [
-    nvme-cli
-    smartmontools
-    lm_sensors
-  ];
 }
 ```
 
 ---
 
-## 6. Provisioning System (Modular)
+## 7. Disko Integration
 
-> **Примечание:** Эта секция описывает внутреннюю реализацию provisioning модулей.
-> Пользовательский интерфейс определён в секции 3.4 (`clusterConfig.provisioners.*`).
-> Каждый provisioner из секции 3.4 реализуется как отдельный модуль, описанный здесь.
+### 7.1 Two Configuration Modes
 
-Provisioning реализован как модульная система — каждый метод это отдельный NixOS модуль, который:
-- Определяет свои опции конфигурации
-- Добавляет activation scripts в bootstrap pipeline
-- Предоставляет pre/post hooks для кастомизации
-- Включает валидацию и healthchecks
+| Mode | When to use | Configuration |
+| --- | --- | --- |
+| **Simple** | Most cases — standard partitioning | `install.disk`, `install.swapSize` |
+| **Custom** | ZFS, RAID, LVM, complex setups | `disko = { devices = { ... }; };` |
 
-### 6.1 Architecture Overview
+### 7.2 Simple Mode (opinionated)
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     Bootstrap Pipeline                               │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  ┌────────────────┐    ┌────────────────┐    ┌────────────────┐    │
-│  │ Provisioning   │    │ Kubernetes     │    │ Cozystack      │    │
-│  │ Module         │───▶│ Module         │───▶│ Module         │    │
-│  └───────┬────────┘    └───────┬────────┘    └───────┬────────┘    │
-│          │                     │                     │              │
-│          ▼                     ▼                     ▼              │
-│  ┌────────────────┐    ┌────────────────┐    ┌────────────────┐    │
-│  │ • pre-hook     │    │ • pre-hook     │    │ • pre-hook     │    │
-│  │ • provision()  │    │ • init/join()  │    │ • install()    │    │
-│  │ • post-hook    │    │ • post-hook    │    │ • post-hook    │    │
-│  │ • healthcheck  │    │ • healthcheck  │    │ • healthcheck  │    │
-│  └────────────────┘    └────────────────┘    └────────────────┘    │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### 6.2 Module Structure
-
-```
-modules/
-├── provisioning/
-│   ├── default.nix           # Base provisioning interface
-│   ├── options.nix           # Common options for all methods
-│   │
-│   ├── methods/
-│   │   ├── nixos-anywhere.nix   # Remote installation
-│   │   ├── pxe.nix              # PXE boot
-│   │   ├── nixos-rebuild.nix    # In-place rebuild
-│   │   └── manual.nix           # Manual (skip provisioning)
-│   │
-│   └── lib/
-│       ├── activation.nix    # Activation script helpers
-│       ├── hooks.nix         # Hook system
-│       └── healthcheck.nix   # Health check utilities
-```
-
-### 6.3 Base Provisioning Interface
+Specify disk and optional parameters. Internally generates standard disko config:
 
 ```nix
-# modules/provisioning/default.nix
-{ config, lib, pkgs, ... }:
+install = {
+  disk = "/dev/sda";           # required: root disk
+  swapSize = "16G";            # optional: swap partition size
+};
+```
+
+**Generated layout:**
+
+```
+/dev/sda (root disk)
+├── EFI  (512M, vfat, /boot)
+├── swap (swapSize, if specified)
+└── root (remainder, ext4, /)
+```
+
+### 7.3 Custom Mode (disko passthrough)
+
+For complex scenarios (ZFS, RAID, LVM), provide raw disko configuration:
+
+```nix
+disko = {
+  devices = {
+    disk.main = {
+      type = "disk";
+      device = "/dev/sda";
+      content = {
+        type = "gpt";
+        partitions = { /* ... */ };
+      };
+    };
+    # zpool, mdraid, lvm_vg, etc.
+  };
+};
+```
+
+**Note:** `install.disk` and `disko` are mutually exclusive. Validation will fail if both are specified.
+
+---
+
+## 8. k3s Integration
+
+### 8.1 How k3s is Integrated
+
+k3s server/agent runs as systemd services configured by NixOS.
+
+Each node's NixOS config receives cluster context via special args:
+
+```nix
+# modules/nixos/k3s.nix (simplified)
+{ config, lib, pkgs, nix8s, ... }:
 
 let
-  cfg = config.cozystack.provisioning;
-
-  # Import all provisioning methods
-  methods = {
-    nixos-anywhere = ./methods/nixos-anywhere.nix;
-    pxe = ./methods/pxe.nix;
-    nixos-rebuild = ./methods/nixos-rebuild.nix;
-    manual = ./methods/manual.nix;
-  };
+  cluster = nix8s.cluster;
+  member = nix8s.member;
+  isFirstServer = member.name == (cluster.ha.firstServer or null);
+  secrets = cluster.secrets;
+  serverUrl = "https://${cluster.ha.vip or member.ip}:6443";
 in
 {
-  imports = [
-    ./options.nix
-  ] ++ (lib.attrValues methods);
-
-  options.cozystack.provisioning = {
-    method = lib.mkOption {
-      type = lib.types.enum [ "nixos-anywhere" "pxe" "nixos-rebuild" "manual" ];
-      default = "nixos-anywhere";
-      description = "Provisioning method to use";
-    };
-
-    # Hook system
-    hooks = {
-      pre = lib.mkOption {
-        type = lib.types.listOf lib.types.package;
-        default = [];
-        description = "Scripts to run before provisioning";
-      };
-
-      post = lib.mkOption {
-        type = lib.types.listOf lib.types.package;
-        default = [];
-        description = "Scripts to run after provisioning";
-      };
-
-      onError = lib.mkOption {
-        type = lib.types.nullOr lib.types.package;
-        default = null;
-        description = "Script to run on provisioning error";
-      };
-    };
-
-    # Healthcheck configuration
-    healthcheck = {
-      enable = lib.mkEnableOption "provisioning healthchecks" // { default = true; };
-
-      timeout = lib.mkOption {
-        type = lib.types.int;
-        default = 300;
-        description = "Healthcheck timeout in seconds";
-      };
-
-      retries = lib.mkOption {
-        type = lib.types.int;
-        default = 3;
-        description = "Number of retries for healthcheck";
-      };
-    };
-
-    # Parallel provisioning
-    parallel = {
-      enable = lib.mkEnableOption "parallel node provisioning";
-
-      maxConcurrent = lib.mkOption {
-        type = lib.types.int;
-        default = 5;
-        description = "Maximum concurrent provisioning operations";
-      };
-    };
-  };
-
-  config = {
-    # Assemble the activation script from the selected method
-    bootstrap.phases.provision = {
-      order = 100;
-      script = cfg.activationScript;
-      healthcheck = cfg.healthcheckScript;
-    };
-  };
-}
-```
-
-### 6.4 Provisioning Options (Per-Node)
-
-```nix
-# modules/provisioning/options.nix
-{ config, lib, ... }:
-
-{
-  options.cozystack.provisioning = {
-    # Per-node provisioning can override cluster-wide method
-    perNode = lib.mkOption {
-      type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
-        options = {
-          method = lib.mkOption {
-            type = lib.types.nullOr (lib.types.enum [
-              "nixos-anywhere" "pxe" "nixos-rebuild" "manual"
-            ]);
-            default = null;
-            description = "Override provisioning method for this node";
-          };
-
-          # Node-specific hooks
-          hooks = {
-            pre = lib.mkOption {
-              type = lib.types.listOf lib.types.package;
-              default = [];
-              description = "Pre-provisioning hooks for this node";
-            };
-
-            post = lib.mkOption {
-              type = lib.types.listOf lib.types.package;
-              default = [];
-              description = "Post-provisioning hooks for this node";
-            };
-          };
-
-          # Skip this node
-          skip = lib.mkOption {
-            type = lib.types.bool;
-            default = false;
-            description = "Skip provisioning this node";
-          };
-        };
-      }));
-      default = {};
-      description = "Per-node provisioning configuration";
-    };
-  };
-}
-```
-
-### 6.5 nixos-anywhere Module
-
-```nix
-# modules/provisioning/methods/nixos-anywhere.nix
-{ config, lib, pkgs, clusterConfig, ... }:
-
-let
-  cfg = config.cozystack.provisioning;
-
-  # Get nodes from clusterConfig.provisioners.nixos-anywhere
-  provisionerCfg = clusterConfig.provisioners.nixos-anywhere or {};
-  nixosAnywhereNodes = provisionerCfg.nodes or {};
-  defaults = provisionerCfg.defaults or {};
-
-in lib.mkIf (builtins.length (builtins.attrNames nixosAnywhereNodes) > 0)
-{
-  options.cozystack.provisioning.nixos-anywhere = {
-    buildOnRemote = lib.mkOption {
-      type = lib.types.bool;
-      default = true;
-      description = "Build NixOS configuration on target machine";
-    };
-
-    extraFlags = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [];
-      description = "Extra flags to pass to nixos-anywhere";
-    };
-
-    kexec = {
-      enable = lib.mkEnableOption "kexec for faster provisioning" // { default = true; };
-
-      image = lib.mkOption {
-        type = lib.types.nullOr lib.types.package;
-        default = null;
-        description = "Custom kexec image";
-      };
-    };
-  };
-
-  config.cozystack.provisioning = {
-    # Generate activation script
-    activationScript = pkgs.writeShellScript "provision-nixos-anywhere" ''
-      set -euo pipefail
-      source ${./lib/activation.nix}/helpers.sh
-
-      log "Provisioning nodes via nixos-anywhere..."
-
-      # Run pre-hooks
-      ${lib.concatMapStrings (hook: ''
-        log "Running pre-hook: ${hook.name}"
-        ${hook}
-      '') cfg.hooks.pre}
-
-      provision_node() {
-        local name="$1"
-        local host="$2"
-        local user="$3"
-        local key="$4"
-        local extra_flags="$5"
-
-        if check_state "provision-$name"; then
-          log "Node $name already provisioned, skipping..."
-          return 0
-        fi
-
-        # Run node-specific pre-hooks
-        ${lib.concatMapStrings (name: let
-          nodeHooks = cfg.perNode.${name}.hooks.pre or [];
-        in lib.concatMapStrings (hook: ''
-          if [[ "$name" == "${name}" ]]; then
-            log "Running node pre-hook for ${name}"
-            ${hook}
-          fi
-        '') nodeHooks) (builtins.attrNames nixosAnywhereNodes)}
-
-        log "Provisioning $name ($host)..."
-
-        ${pkgs.nixos-anywhere}/bin/nixos-anywhere \
-          --flake ".#$name" \
-          --target-host "$user@$host" \
-          --ssh-option "IdentityFile=$key" \
-          --ssh-option "StrictHostKeyChecking=no" \
-          ${lib.optionalString cfg.nixos-anywhere.buildOnRemote "--build-on-remote"} \
-          ${lib.optionalString cfg.nixos-anywhere.kexec.enable "--kexec"} \
-          ${lib.concatStringsSep " " cfg.nixos-anywhere.extraFlags} \
-          $extra_flags
-
-        mark_done "provision-$name"
-
-        # Run node-specific post-hooks
-        ${lib.concatMapStrings (name: let
-          nodeHooks = cfg.perNode.${name}.hooks.post or [];
-        in lib.concatMapStrings (hook: ''
-          if [[ "$name" == "${name}" ]]; then
-            log "Running node post-hook for ${name}"
-            ${hook}
-          fi
-        '') nodeHooks) (builtins.attrNames nixosAnywhereNodes)}
-      }
-
-      ${if cfg.parallel.enable then ''
-        # Parallel provisioning
-        log "Running parallel provisioning (max ${toString cfg.parallel.maxConcurrent} concurrent)..."
-
-        ${lib.concatMapStringsSep "\n" (name: let
-          node = nixosAnywhereNodes.${name};
-          sshUser = node.ssh.user or defaults.ssh.user or "root";
-          sshHost = node.ssh.host or node.ip;
-          sshKey = node.ssh.keyFile or defaults.ssh.keyFile;
-          extraFlags = lib.concatStringsSep " " (
-            (lib.optional (node.disko.encryption.enable or false)
-              "--disk-encryption-keys /tmp/disk.key <(cat ${node.disko.encryption.keyFile})")
-          );
-        in ''
-          provision_node "${name}" "${sshHost}" "${sshUser}" "${sshKey}" "${extraFlags}" &
-
-          # Limit concurrent jobs
-          while [[ $(jobs -r -p | wc -l) -ge ${toString cfg.parallel.maxConcurrent} ]]; do
-            sleep 1
-          done
-        '') (builtins.attrNames nixosAnywhereNodes)}
-
-        # Wait for all jobs
-        wait
-      '' else ''
-        # Sequential provisioning
-        ${lib.concatMapStringsSep "\n" (name: let
-          node = nixosAnywhereNodes.${name};
-          sshUser = node.ssh.user or defaults.ssh.user or "root";
-          sshHost = node.ssh.host or node.ip;
-          sshKey = node.ssh.keyFile or defaults.ssh.keyFile;
-          extraFlags = lib.concatStringsSep " " (
-            (lib.optional (node.disko.encryption.enable or false)
-              "--disk-encryption-keys /tmp/disk.key <(cat ${node.disko.encryption.keyFile})")
-          );
-        in ''
-          provision_node "${name}" "${sshHost}" "${sshUser}" "${sshKey}" "${extraFlags}"
-        '') (builtins.attrNames nixosAnywhereNodes)}
-      ''}
-
-      # Run post-hooks
-      ${lib.concatMapStrings (hook: ''
-        log "Running post-hook: ${hook.name}"
-        ${hook}
-      '') cfg.hooks.post}
-
-      log "nixos-anywhere provisioning complete"
-    '';
-
-    # Healthcheck script
-    healthcheckScript = pkgs.writeShellScript "healthcheck-nixos-anywhere" ''
-      set -euo pipefail
-      source ${./lib/healthcheck.nix}/helpers.sh
-
-      ${lib.concatMapStringsSep "\n" (name: let
-        node = nixosAnywhereNodes.${name};
-        sshUser = node.ssh.user or defaults.ssh.user or "root";
-        sshHost = node.ssh.host or node.ip;
-        sshKey = node.ssh.keyFile or defaults.ssh.keyFile;
-      in ''
-        check_ssh "${name}" "${sshHost}" "${sshUser}" "${sshKey}" ${toString cfg.healthcheck.timeout}
-        check_nixos "${name}" "${sshHost}" "${sshUser}" "${sshKey}"
-      '') (builtins.attrNames nixosAnywhereNodes)}
-    '';
-  };
-}
-```
-
-### 6.6 PXE Module
-
-```nix
-# modules/provisioning/methods/pxe.nix
-{ config, lib, pkgs, clusterConfig, ... }:
-
-let
-  cfg = config.cozystack.provisioning;
-
-  # Get nodes from clusterConfig.provisioners.pxe
-  provisionerCfg = clusterConfig.provisioners.pxe or {};
-  pxeNodes = provisionerCfg.nodes or {};
-  pxeCfg = provisionerCfg.server or {};
-  defaults = provisionerCfg.defaults or {};
-
-in lib.mkIf (builtins.length (builtins.attrNames pxeNodes) > 0)
-{
-  options.cozystack.provisioning.pxe = {
-    server = {
-      enable = lib.mkEnableOption "PXE server on bootstrap node";
-
-      ip = lib.mkOption {
-        type = lib.types.str;
-        description = "PXE server IP address";
-      };
-
-      interface = lib.mkOption {
-        type = lib.types.str;
-        default = "eth0";
-        description = "Network interface for PXE server";
-      };
-    };
-
-    dhcp = {
-      enable = lib.mkEnableOption "DHCP server" // { default = true; };
-
-      range = lib.mkOption {
-        type = lib.types.str;
-        example = "192.168.1.100-192.168.1.200";
-        description = "DHCP address range";
-      };
-
-      subnet = lib.mkOption {
-        type = lib.types.str;
-        example = "192.168.1.0/24";
-        description = "DHCP subnet";
-      };
-    };
-
-    tftp = {
-      enable = lib.mkEnableOption "TFTP server" // { default = true; };
-
-      root = lib.mkOption {
-        type = lib.types.path;
-        default = "/var/lib/tftp";
-        description = "TFTP root directory";
-      };
-    };
-
-    http = {
-      enable = lib.mkEnableOption "HTTP server for images" // { default = true; };
-
-      port = lib.mkOption {
-        type = lib.types.int;
-        default = 8080;
-        description = "HTTP server port";
-      };
-    };
-
-    # Timeout waiting for nodes to boot
-    bootTimeout = lib.mkOption {
-      type = lib.types.int;
-      default = 600;
-      description = "Timeout in seconds waiting for PXE boot";
-    };
-
-    # Callback mechanism
-    callback = {
-      enable = lib.mkEnableOption "node callback after boot" // { default = true; };
-
-      port = lib.mkOption {
-        type = lib.types.int;
-        default = 8081;
-        description = "Callback server port";
-      };
-    };
-  };
-
-  config = {
-    # Helper to resolve role from nodeConfigurations
-    resolveRole = configName:
-      let
-        resolve = name:
-          let cfg = clusterConfig.nodeConfigurations.${name}; in
-          if cfg ? role then cfg.role
-          else if cfg ? extends then resolve cfg.extends
-          else throw "No role in configuration chain: ${configName}";
-      in resolve configName;
-
-    # Generate netboot images for each PXE node
-    cozystack.provisioning.pxe.nodeImages = lib.mapAttrs (name: nodeCfg:
-      let
-        nodeRole = config.resolveRole nodeCfg.configuration;
-      in
-      (pkgs.nixos {
-        imports = [
-          ../../node/default.nix
-          (if nodeRole == "control-plane"
-           then ../../node/control-plane.nix
-           else ../../node/worker.nix)
-          # Include node-specific modules
-        ] ++ (nodeCfg.modules or []);
-
-        config = {
-          networking.hostName = name;
-          # Auto-install on boot
-          cozystack.autoInstall = {
-            enable = true;
-            callbackUrl = "http://${pxeCfg.server.ip}:${toString pxeCfg.callback.port}/ready/${name}";
-          };
-        };
-      }).config.system.build.netboot
-    ) pxeNodes;
-
-    # PXE server NixOS configuration (if enabled)
-    cozystack.provisioning.pxeServerConfig = lib.mkIf pxeCfg.server.enable {
-      # DHCP server (kea)
-      services.kea.dhcp4 = lib.mkIf pxeCfg.dhcp.enable {
-        enable = true;
-        settings = {
-          interfaces-config.interfaces = [ pxeCfg.server.interface ];
-          subnet4 = [{
-            subnet = pxeCfg.dhcp.subnet;
-            pools = [{ pool = pxeCfg.dhcp.range; }];
-
-            option-data = [
-              { name = "routers"; data = pxeCfg.server.ip; }
-              { name = "domain-name-servers"; data = pxeCfg.server.ip; }
-            ];
-
-            reservations = lib.mapAttrsToList (name: nodeCfg: {
-              hw-address = nodeCfg.mac;
-              ip-address = nodeCfg.ip;
-              hostname = name;
-              next-server = pxeCfg.server.ip;
-              boot-file-name = "ipxe-${name}.efi";
-            }) pxeNodes;
-          }];
-        };
-      };
-
-      # TFTP server
-      services.atftpd = lib.mkIf pxeCfg.tftp.enable {
-        enable = true;
-        root = pkgs.runCommand "tftp-root" {} ''
-          mkdir -p $out
-          ${lib.concatMapStringsSep "\n" (name: ''
-            cp ${config.cozystack.provisioning.pxe.nodeImages.${name}}/ipxe.efi $out/ipxe-${name}.efi
-          '') (builtins.attrNames pxeNodes)}
-        '';
-      };
-
-      # HTTP server for images
-      services.nginx = lib.mkIf pxeCfg.http.enable {
-        enable = true;
-        virtualHosts."netboot" = {
-          listen = [{ addr = pxeCfg.server.ip; port = pxeCfg.http.port; }];
-          locations = lib.mapAttrs' (name: _: {
-            name = "/${name}";
-            value = {
-              root = config.cozystack.provisioning.pxe.nodeImages.${name};
-            };
-          }) pxeNodes;
-        };
-      };
-
-      # Callback server (simple HTTP to track node readiness)
-      systemd.services.pxe-callback = lib.mkIf pxeCfg.callback.enable {
-        description = "PXE Callback Server";
-        wantedBy = [ "multi-user.target" ];
-
-        script = ''
-          ${pkgs.python3}/bin/python3 ${pkgs.writeText "callback-server.py" ''
-            from http.server import HTTPServer, BaseHTTPRequestHandler
-            import os
-
-            STATE_DIR = os.environ.get("STATE_DIR", "/var/lib/cozystack-bootstrap")
-
-            class Handler(BaseHTTPRequestHandler):
-                def do_POST(self):
-                    if self.path.startswith("/ready/"):
-                        node = self.path.split("/")[-1]
-                        os.makedirs(f"{STATE_DIR}/pxe-ready", exist_ok=True)
-                        open(f"{STATE_DIR}/pxe-ready/{node}", "w").close()
-                        self.send_response(200)
-                        self.end_headers()
-                        self.wfile.write(b"OK")
-                    else:
-                        self.send_response(404)
-                        self.end_headers()
-
-            HTTPServer(("0.0.0.0", ${toString pxeCfg.callback.port}), Handler).serve_forever()
-          ''}
-        '';
-      };
-    };
-
-    # Activation script for PXE provisioning
-    cozystack.provisioning.activationScript = lib.mkIf (cfg.method == "pxe") (
-      pkgs.writeShellScript "provision-pxe" ''
-        set -euo pipefail
-        source ${./lib/activation.nix}/helpers.sh
-
-        log "Provisioning nodes via PXE..."
-
-        # Run pre-hooks
-        ${lib.concatMapStrings (hook: "${hook}\n") cfg.hooks.pre}
-
-        # Wait for all nodes to call back
-        log "Waiting for nodes to boot and call back..."
-
-        TIMEOUT=${toString pxeCfg.bootTimeout}
-        ELAPSED=0
-
-        while true; do
-          ALL_READY=true
-
-          ${lib.concatMapStringsSep "\n" (name: ''
-            if [[ ! -f "$STATE_DIR/pxe-ready/${name}" ]]; then
-              ALL_READY=false
-              log "Waiting for ${name}..."
-            fi
-          '') (builtins.attrNames pxeNodes)}
-
-          if $ALL_READY; then
-            log "All nodes have booted successfully"
-            break
-          fi
-
-          if [[ $ELAPSED -ge $TIMEOUT ]]; then
-            error "Timeout waiting for PXE nodes"
-            exit 1
-          fi
-
-          sleep 10
-          ELAPSED=$((ELAPSED + 10))
-        done
-
-        # Mark nodes as provisioned
-        ${lib.concatMapStringsSep "\n" (name: ''
-          mark_done "provision-${name}"
-        '') (builtins.attrNames pxeNodes)}
-
-        # Run post-hooks
-        ${lib.concatMapStrings (hook: "${hook}\n") cfg.hooks.post}
-
-        log "PXE provisioning complete"
-      ''
+  services.k3s = {
+    enable = true;
+    package = pkgs.k3s;
+
+    role = member.role;  # "server" or "agent"
+
+    # Token for cluster membership
+    token = secrets.token;
+
+    # Server URL (for joining)
+    serverAddr = lib.mkIf (!isFirstServer) serverUrl;
+
+    # Extra flags
+    extraFlags = lib.concatStringsSep " " (
+      (lib.optionals (member.role == "server" && isFirstServer) [
+        "--cluster-init"
+      ])
+      ++ (lib.optionals (member.role == "server") (
+        cluster.k3s.extraArgs.server or []
+      ))
+      ++ (lib.optionals (member.role == "agent") (
+        cluster.k3s.extraArgs.agent or []
+      ))
+      ++ [
+        "--node-ip=${member.ip}"
+      ]
     );
   };
 }
 ```
 
-### 6.7 nixos-rebuild Module (In-Place Updates)
+### 8.2 Provisioning Order
 
-```nix
-# modules/provisioning/methods/nixos-rebuild.nix
-{ config, lib, pkgs, clusterConfig, ... }:
+`provision-all` respects the correct order:
 
-let
-  cfg = config.cozystack.provisioning;
+1. **First server** — `k3s server --cluster-init`, initializes cluster
+2. **Additional servers** — `k3s server --server=...`, join as servers
+3. **Agents** — `k3s agent --server=...`, join as agents
 
-  # Get nodes from clusterConfig.provisioners.nixos-rebuild
-  provisionerCfg = clusterConfig.provisioners.nixos-rebuild or {};
-  rebuildNodes = provisionerCfg.nodes or {};
-  rebuildCfg = provisionerCfg.defaults or {};
-
-in lib.mkIf (builtins.length (builtins.attrNames rebuildNodes) > 0)
-{
-  options.cozystack.provisioning.nixos-rebuild = {
-    flakeRef = lib.mkOption {
-      type = lib.types.str;
-      default = ".";
-      example = "github:myorg/cluster";
-      description = "Flake reference for nixos-rebuild";
-    };
-
-    action = lib.mkOption {
-      type = lib.types.enum [ "switch" "boot" "test" ];
-      default = "switch";
-      description = "nixos-rebuild action";
-    };
-
-    useRemoteSudo = lib.mkOption {
-      type = lib.types.bool;
-      default = false;
-      description = "Use sudo on remote host";
-    };
-
-    rollback = {
-      enable = lib.mkEnableOption "automatic rollback on failure";
-
-      timeout = lib.mkOption {
-        type = lib.types.int;
-        default = 60;
-        description = "Seconds to wait before confirming successful deployment";
-      };
-    };
-  };
-
-  config.cozystack.provisioning.activationScript = lib.mkIf (cfg.method == "nixos-rebuild") (
-    pkgs.writeShellScript "provision-nixos-rebuild" ''
-      set -euo pipefail
-      source ${./lib/activation.nix}/helpers.sh
-
-      log "Updating nodes via nixos-rebuild..."
-
-      # Run pre-hooks
-      ${lib.concatMapStrings (hook: "${hook}\n") cfg.hooks.pre}
-
-      rebuild_node() {
-        local name="$1"
-        local host="$2"
-        local user="$3"
-        local key="$4"
-
-        log "Rebuilding $name..."
-
-        ssh -o StrictHostKeyChecking=no -i "$key" "$user@$host" \
-          "${lib.optionalString rebuildCfg.useRemoteSudo "sudo "}nixos-rebuild ${rebuildCfg.action} \
-            --flake ${rebuildCfg.flakeRef}#$name \
-            ${lib.optionalString rebuildCfg.rollback.enable "--rollback-on-failure"}"
-
-        ${lib.optionalString rebuildCfg.rollback.enable ''
-          # Wait and confirm deployment
-          log "Waiting ${toString rebuildCfg.rollback.timeout}s to confirm deployment..."
-          sleep ${toString rebuildCfg.rollback.timeout}
-
-          # Verify node is healthy
-          if ssh -o StrictHostKeyChecking=no -i "$key" "$user@$host" "systemctl is-system-running --wait" 2>/dev/null; then
-            log "$name deployment confirmed"
-          else
-            warn "$name may have issues, check manually"
-          fi
-        ''}
-
-        mark_done "provision-$name"
-      }
-
-      ${lib.concatMapStringsSep "\n" (name: let
-        node = rebuildNodes.${name};
-        sshUser = node.ssh.user or rebuildCfg.ssh.user or "root";
-        sshHost = node.ssh.host or node.ip;
-        sshKey = node.ssh.keyFile or rebuildCfg.ssh.keyFile;
-      in ''
-        if ! check_state "provision-${name}"; then
-          rebuild_node "${name}" "${sshHost}" "${sshUser}" "${sshKey}"
-        else
-          log "${name} already up to date, skipping..."
-        fi
-      '') (builtins.attrNames rebuildNodes)}
-
-      # Run post-hooks
-      ${lib.concatMapStrings (hook: "${hook}\n") cfg.hooks.post}
-
-      log "nixos-rebuild provisioning complete"
-    ''
-  );
-}
+```bash
+# provision-all internally does:
+# 1. provision server1 (waits for k3s ready)
+# 2. provision server2, server3 in parallel
+# 3. provision agents in parallel
 ```
 
-### 6.8 Manual Module (Skip Provisioning)
+### 8.3 Token Management
 
-```nix
-# modules/provisioning/methods/manual.nix
-{ config, lib, pkgs, clusterConfig, ... }:
+Tokens are pre-generated and stored encrypted:
 
-let
-  cfg = config.cozystack.provisioning;
+```bash
+# Generate secrets
+nix run .#gen-secrets -- prod
 
-  # Get nodes from clusterConfig.provisioners.manual
-  provisionerCfg = clusterConfig.provisioners.manual or {};
-  manualNodes = provisionerCfg.nodes or {};
-  manualCfg = provisionerCfg.defaults or {};
+# Encrypt
+sops --encrypt --in-place secrets/prod.nix
 
-in lib.mkIf (builtins.length (builtins.attrNames manualNodes) > 0)
-{
-  options.cozystack.provisioning.manual = {
-    waitForReady = lib.mkOption {
-      type = lib.types.bool;
-      default = true;
-      description = "Wait for nodes to be reachable via SSH";
-    };
-
-    expectedNixosVersion = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      description = "Expected NixOS version (for validation)";
-    };
-  };
-
-  config.cozystack.provisioning.activationScript = lib.mkIf (cfg.method == "manual") (
-    pkgs.writeShellScript "provision-manual" ''
-      set -euo pipefail
-      source ${./lib/activation.nix}/helpers.sh
-
-      log "Manual provisioning mode - expecting nodes to be pre-configured"
-
-      ${lib.optionalString (provisionerCfg.waitForSsh or true) ''
-        log "Waiting for nodes to be reachable..."
-
-        ${lib.concatMapStringsSep "\n" (name: let
-          node = manualNodes.${name};
-          sshUser = node.ssh.user or manualCfg.ssh.user or "root";
-          sshHost = node.ssh.host or node.ip;
-          sshKey = node.ssh.keyFile or manualCfg.ssh.keyFile;
-        in ''
-          wait_for_ssh "${name}" "${sshHost}" "${sshUser}" "${sshKey}"
-
-          ${lib.optionalString (provisionerCfg.validateNixos or false) ''
-            # Validate NixOS
-            ACTUAL=$(ssh -o StrictHostKeyChecking=no -i "${sshKey}" \
-              "${sshUser}@${sshHost}" "nixos-version" 2>/dev/null || echo "unknown")
-
-            log "${name}: NixOS version $ACTUAL"
-          ''}
-
-          mark_done "provision-${name}"
-        '') (builtins.attrNames manualNodes)}
-      ''}
-
-      log "Manual provisioning checks complete"
-    ''
-  );
-}
+# Use in config
+clusters.prod.secrets = import ./secrets/prod.nix;
 ```
 
-### 6.9 Using Provisioning Modules
+### 8.4 Rebuild Workflow (drain/cordon)
 
-> **Примечание:** Этот пример соответствует схеме из секции 3.4.
+`rebuild-<cluster>-<node>` and `rebuild-<cluster>-all` perform safe rolling updates with Kubernetes-aware node management.
 
-```nix
-# Example: Cluster with mixed provisioning methods
-{
-  clusterConfig = {
-    name = "hybrid-cluster";
+**Single node rebuild:**
 
-    nodeConfigurations = {
-      base.profiles = [ "base" "kubernetes" ];
-
-      control-plane = {
-        extends = "base";
-        role = "control-plane";
-        disko.profile = "etcd-optimized";
-      };
-
-      worker = {
-        extends = "base";
-        role = "worker";
-        disko.profile = "simple";
-      };
-    };
-
-    # Каждый provisioner определяет КАК и КУДА деплоить
-    provisioners = {
-      # nixos-anywhere для основных нод
-      nixos-anywhere = {
-        defaults = {
-          ssh = { user = "root"; keyFile = ./keys/deploy; };
-          buildOnRemote = true;
-          kexec = true;
-        };
-
-        nodes = {
-          cp1 = {
-            configuration = "control-plane";
-            ip = "192.168.1.10";
-            ssh.host = "192.168.1.10";
-            disko.disks = { main = "/dev/sda"; etcd = "/dev/nvme0n1"; };
-          };
-          cp2 = {
-            configuration = "control-plane";
-            ip = "192.168.1.11";
-            ssh.host = "192.168.1.11";
-            disko.disks = { main = "/dev/sda"; etcd = "/dev/nvme0n1"; };
-          };
-          worker1 = {
-            configuration = "worker";
-            ip = "192.168.1.20";
-            ssh.host = "192.168.1.20";
-            disko.disks.main = "/dev/sda";
-          };
-        };
-      };
-
-      # PXE для удалённого ДЦ
-      pxe = {
-        server = {
-          ip = "10.20.1.1";
-          interface = "eth0";
-          dhcp = {
-            range = "10.20.1.100-10.20.1.200";
-            subnet = "10.20.1.0/24";
-          };
-        };
-        defaults.ssh = { user = "root"; keyFile = ./keys/deploy; };
-
-        nodes = {
-          worker-dc2-01 = {
-            configuration = "worker";
-            ip = "10.20.1.50";
-            mac = "aa:bb:cc:dd:ee:50";
-            disko.disks.main = "/dev/sda";
-          };
-        };
-      };
-
-      # nixos-rebuild для существующих NixOS машин
-      nixos-rebuild = {
-        defaults = {
-          ssh = { user = "root"; keyFile = ./keys/deploy; };
-          action = "switch";
-        };
-
-        nodes = {
-          legacy-node = {
-            configuration = "worker";
-            ip = "192.168.1.100";
-            ssh.host = "192.168.1.100";
-          };
-        };
-      };
-
-      # manual для уже настроенных нод
-      manual = {
-        waitForSsh = true;
-        validateNixos = true;
-        defaults.ssh = { user = "root"; keyFile = ./keys/deploy; };
-
-        nodes = {
-          special-node = {
-            configuration = "worker";
-            ip = "192.168.1.200";
-            ssh.host = "192.168.1.200";
-          };
-        };
-      };
-    };
-
-    # Reconciler settings
-    reconciler = {
-      update.strategy = "rolling";
-      discovery.ttl = 3600;
-    };
-  };
-}
+```bash
+nix run .#rebuild-prod-server1
 ```
 
-### 6.10 Module Priority Diagram
+Internally executes:
+1. `kubectl cordon prod-server1`
+2. `kubectl drain prod-server1 --ignore-daemonsets --delete-emptydir-data`
+3. `nixos-rebuild switch --target-host prod-server1`
+4. Wait for node Ready
+5. `kubectl uncordon prod-server1`
+
+**All nodes rebuild:**
+
+```bash
+nix run .#rebuild-prod-all
+```
+
+Internally executes (one node at a time):
+1. Agents first (sorted alphabetically)
+2. Servers next (except first server)
+3. First server last
+
+For each node: cordon → drain → rebuild → wait Ready → uncordon.
+
+**Rolling update diagram:**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                   Provisioning Pipeline                          │
+│                    rebuild-prod-all Flow                         │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
-│  For each node:                                                  │
-│                                                                  │
-│  1. Determine method:                                            │
-│     perNode.${name}.method ?? cluster.provisioning.method       │
-│                                                                  │
-│  2. Check skip:                                                  │
-│     if perNode.${name}.skip → skip node                         │
-│                                                                  │
-│  3. Run global pre-hooks                                         │
-│  4. Run node pre-hooks                                           │
-│  5. Execute method-specific provisioning                         │
-│  6. Run node post-hooks                                          │
-│  7. Run healthcheck                                              │
-│  8. Mark as done                                                 │
-│  9. Run global post-hooks (after all nodes)                      │
-│                                                                  │
-│  Error handling:                                                  │
-│  - On error → run onError hook                                   │
-│  - Retry logic per healthcheck config                            │
-│  - State preserved for resume                                    │
+│  1. agent1: cordon → drain → rebuild → ready → uncordon         │
+│  2. agent2: cordon → drain → rebuild → ready → uncordon         │
+│  3. ...                                                          │
+│  4. server2: cordon → drain → rebuild → ready → uncordon        │
+│  5. server3: cordon → drain → rebuild → ready → uncordon        │
+│  6. server1 (first): cordon → drain → rebuild → ready → uncordon│
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.11 Extensible Activation System
-
-Ключевой принцип: **provisioners и другие модули не захардкожены в bootstrap скрипт**, а регистрируют себя через стандартный механизм activation scripts. Это позволяет:
-
-- Добавлять новые provisioners без изменения core bootstrap
-- Provisioners могут зависеть друг от друга
-- Extensions (DRBD, GPU) встраиваются в нужные фазы
-- Пользователь может добавить свои шаги
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Модульная архитектура                             │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐                 │
-│  │nixos-anywhere│ │     pxe      │ │  terraform   │  ...            │
-│  │   module     │ │    module    │ │    module    │                 │
-│  └──────┬───────┘ └──────┬───────┘ └──────┬───────┘                 │
-│         │                │                │                          │
-│         │ registers      │ registers      │ registers                │
-│         ▼                ▼                ▼                          │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │           bootstrap.phases.provisioning           │    │
-│  │                    .activationScripts                       │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-│                              │                                       │
-│                              ▼                                       │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │                  Bootstrap Pipeline                          │    │
-│  │  pre → discovery → provisioning → kubernetes → cozystack    │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-Система точек расширения аналогична NixOS activation scripts:
-
-```nix
-# lib/activation.nix
-{ lib }:
-
-{
-  # Тип для activation script
-  activationScriptType = lib.types.submodule {
-    options = {
-      text = lib.mkOption {
-        type = lib.types.lines;
-        description = "Script content";
-      };
-
-      deps = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        default = [];
-        description = "Dependencies (other script names that must run first)";
-      };
-
-      supportsDryRun = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = "Whether script supports --dry-run mode";
-      };
-    };
-  };
-
-  # Сортировка скриптов по зависимостям (topological sort)
-  sortScripts = scripts:
-    let
-      # Build dependency graph and sort
-      names = builtins.attrNames scripts;
-      getDeps = name: scripts.${name}.deps or [];
-
-      visit = visited: name:
-        if builtins.elem name visited then visited
-        else let
-          deps = getDeps name;
-          visitedWithDeps = builtins.foldl' visit visited deps;
-        in visitedWithDeps ++ [ name ];
-
-    in builtins.foldl' visit [] names;
-}
-```
-
-#### Bootstrap Phases с точками расширения
-
-```nix
-# modules/bootstrap/phases.nix
-{ config, lib, pkgs, ... }:
-
-let
-  cfg = config.bootstrap;
-  activationLib = import ../../lib/activation.nix { inherit lib; };
-in
-{
-  options.bootstrap = {
-    # ═══════════════════════════════════════════════════════════════
-    # Phases — упорядоченные этапы bootstrap
-    # ═══════════════════════════════════════════════════════════════
-    phases = lib.mkOption {
-      type = lib.types.attrsOf (lib.types.submodule {
-        options = {
-          order = lib.mkOption {
-            type = lib.types.int;
-            description = "Execution order (lower = earlier)";
-          };
-
-          # Activation scripts внутри фазы
-          activationScripts = lib.mkOption {
-            type = lib.types.attrsOf activationLib.activationScriptType;
-            default = {};
-            description = "Scripts to run in this phase";
-          };
-
-          # Условие выполнения фазы
-          condition = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = "Bash condition for phase execution";
-          };
-        };
-      });
-      default = {};
-    };
-
-    # ═══════════════════════════════════════════════════════════════
-    # Global activation scripts (вне фаз)
-    # ═══════════════════════════════════════════════════════════════
-    activationScripts = lib.mkOption {
-      type = lib.types.attrsOf activationLib.activationScriptType;
-      default = {};
-      description = "Global activation scripts";
-    };
-  };
-
-  config.bootstrap.phases = {
-    # Предопределённые фазы
-    pre = {
-      order = 0;
-      activationScripts = {};
-    };
-
-    discovery = {
-      order = 100;
-      activationScripts = {};
-    };
-
-    provisioning = {
-      order = 200;
-      activationScripts = {};
-    };
-
-    kubernetes = {
-      order = 300;
-      activationScripts = {};
-    };
-
-    cozystack = {
-      order = 400;
-      activationScripts = {};
-    };
-
-    post = {
-      order = 1000;
-      activationScripts = {};
-    };
-  };
-}
-```
-
-#### Пример: Provisioner регистрирует activation scripts
-
-```nix
-# modules/provisioning/methods/nixos-anywhere.nix
-{ config, lib, pkgs, clusterConfig, ... }:
-
-let
-  provisionerCfg = clusterConfig.provisioners.nixos-anywhere or {};
-  nodes = provisionerCfg.nodes or {};
-in
-lib.mkIf (builtins.length (builtins.attrNames nodes) > 0) {
-  # Регистрируем скрипты в фазу provisioning
-  bootstrap.phases.provisioning.activationScripts = {
-    # Основной скрипт провижена
-    nixos-anywhere-provision = {
-      deps = [ "check-ssh-keys" ];  # Зависит от проверки ключей
-      text = ''
-        log "Provisioning nodes via nixos-anywhere..."
-        ${lib.concatMapStringsSep "\n" (name: ''
-          provision_nixos_anywhere "${name}"
-        '') (builtins.attrNames nodes)}
-      '';
-    };
-
-    # Проверка SSH ключей (другие модули тоже могут зависеть от неё)
-    check-ssh-keys = {
-      deps = [];
-      supportsDryRun = true;
-      text = ''
-        log "Checking SSH keys..."
-        ${lib.concatMapStringsSep "\n" (name: let
-          node = nodes.${name};
-          keyFile = node.ssh.keyFile or provisionerCfg.defaults.ssh.keyFile;
-        in ''
-          if [[ ! -f "${keyFile}" ]]; then
-            error "SSH key not found: ${keyFile}"
-          fi
-        '') (builtins.attrNames nodes)}
-      '';
-    };
-  };
-
-  # Можно добавлять скрипты в другие фазы
-  bootstrap.phases.post.activationScripts = {
-    nixos-anywhere-cleanup = {
-      deps = [];
-      text = ''
-        log "Cleaning up nixos-anywhere temporary files..."
-        rm -rf /tmp/nixos-anywhere-*
-      '';
-    };
-  };
-}
-```
-
-#### Пример: PXE provisioner регистрируется в pipeline
-
-```nix
-# modules/provisioning/methods/pxe.nix
-{ config, lib, pkgs, clusterConfig, ... }:
-
-let
-  provisionerCfg = clusterConfig.provisioners.pxe or {};
-  nodes = provisionerCfg.nodes or {};
-  serverCfg = provisionerCfg.server or {};
-in
-lib.mkIf (builtins.length (builtins.attrNames nodes) > 0) {
-  # PXE требует запуска сервера ДО провижена
-  bootstrap.phases.pre.activationScripts = {
-    pxe-server-start = {
-      deps = [];
-      text = ''
-        log "Starting PXE server..."
-        # Запуск DHCP/TFTP/HTTP серверов
-        systemctl start pxe-server.service
-      '';
-    };
-  };
-
-  # Основной скрипт ожидания PXE нод
-  bootstrap.phases.provisioning.activationScripts = {
-    pxe-provision = {
-      deps = [ "pxe-server-start" ];  # Зависит от старта сервера
-      text = ''
-        log "Waiting for PXE nodes to boot..."
-        ${lib.concatMapStringsSep "\n" (name: ''
-          wait_for_pxe_callback "${name}" ${toString (provisionerCfg.bootTimeout or 600)}
-        '') (builtins.attrNames nodes)}
-      '';
-    };
-  };
-
-  # Остановка PXE сервера после провижена
-  bootstrap.phases.post.activationScripts = {
-    pxe-server-stop = {
-      deps = [];
-      text = ''
-        log "Stopping PXE server..."
-        systemctl stop pxe-server.service
-      '';
-    };
-  };
-}
-```
-
-#### Пример: Terraform provisioner
-
-```nix
-# modules/provisioning/methods/terraform.nix
-{ config, lib, pkgs, clusterConfig, ... }:
-
-let
-  provisionerCfg = clusterConfig.provisioners.terraform or {};
-  nodes = provisionerCfg.nodes or {};
-in
-lib.mkIf (builtins.length (builtins.attrNames nodes) > 0) {
-  # Terraform init в фазе pre
-  bootstrap.phases.pre.activationScripts = {
-    terraform-init = {
-      deps = [];
-      supportsDryRun = true;
-      text = ''
-        log "Initializing Terraform..."
-        cd $TERRAFORM_DIR && terraform init
-      '';
-    };
-  };
-
-  # Terraform apply в фазе provisioning
-  bootstrap.phases.provisioning.activationScripts = {
-    terraform-provision = {
-      deps = [ "terraform-init" ];
-      text = ''
-        log "Applying Terraform configuration..."
-        cd $TERRAFORM_DIR && terraform apply -auto-approve
-
-        # Записываем IP адреса созданных нод в state
-        ${lib.concatMapStringsSep "\n" (name: ''
-          IP=$(terraform output -raw ${name}_ip)
-          echo "$IP" > "$STATE_DIR/nodes/${name}/ip"
-        '') (builtins.attrNames nodes)}
-      '';
-    };
-
-    # После создания VM — установка NixOS
-    terraform-nixos-install = {
-      deps = [ "terraform-provision" ];
-      text = ''
-        log "Installing NixOS on Terraform VMs..."
-        ${lib.concatMapStringsSep "\n" (name: ''
-          IP=$(cat "$STATE_DIR/nodes/${name}/ip")
-          nixos-anywhere --flake .#${name} --target-host root@$IP
-        '') (builtins.attrNames nodes)}
-      '';
-    };
-  };
-}
-```
-
-#### Пример: Extension регистрирует свои скрипты
-
-```nix
-# modules/node/extensions/drbd.nix
-{ config, lib, pkgs, clusterConfig, ... }:
-
-lib.mkIf config.cozystack.extensions.drbd.enable {
-  # DRBD добавляет скрипт в фазу post-provisioning
-  bootstrap.phases.provisioning.activationScripts = {
-    drbd-configure = {
-      deps = [ "nixos-anywhere-provision" "pxe-provision" ];  # После любого провижена
-      text = ''
-        log "Configuring DRBD on nodes..."
-        # DRBD-specific setup
-      '';
-    };
-  };
-
-  # И скрипт проверки в фазу kubernetes (перед стартом кластера)
-  bootstrap.phases.kubernetes.activationScripts = {
-    drbd-healthcheck = {
-      deps = [];
-      supportsDryRun = true;
-      text = ''
-        log "Checking DRBD status..."
-        # Проверка что DRBD sync завершён
-      '';
-    };
-  };
-}
-```
-
-#### Генерация финального bootstrap скрипта
-
-```nix
-# apps/bootstrap/generate.nix
-{ pkgs, lib, config, ... }:
-
-let
-  cfg = config.bootstrap;
-  activationLib = import ../../lib/activation.nix { inherit lib; };
-
-  # Сортируем фазы по order
-  sortedPhases = lib.sort (a: b: a.order < b.order)
-    (lib.mapAttrsToList (name: phase: phase // { inherit name; }) cfg.phases);
-
-  # Генерируем скрипт для одной фазы
-  generatePhaseScript = phase:
-    let
-      sortedScripts = activationLib.sortScripts phase.activationScripts;
-    in ''
-      # ═══════════════════════════════════════════════════════════
-      # Phase: ${phase.name}
-      # ═══════════════════════════════════════════════════════════
-      ${lib.optionalString (phase.condition != null) ''
-        if ${phase.condition}; then
-      ''}
-
-      log "Starting phase: ${phase.name}"
-
-      ${lib.concatMapStringsSep "\n\n" (scriptName:
-        let script = phase.activationScripts.${scriptName}; in ''
-          # --- ${scriptName} ---
-          ${lib.optionalString script.supportsDryRun ''
-            if [[ "''${DRY_RUN:-}" == "1" ]]; then
-              log "[DRY-RUN] Would run: ${scriptName}"
-            else
-          ''}
-          ${script.text}
-          ${lib.optionalString script.supportsDryRun ''
-            fi
-          ''}
-        ''
-      ) sortedScripts}
-
-      log "Completed phase: ${phase.name}"
-
-      ${lib.optionalString (phase.condition != null) ''
-        fi
-      ''}
-    '';
-
-in pkgs.writeShellApplication {
-  name = "bootstrap-cluster";
-
-  runtimeInputs = with pkgs; [ openssh jq kubectl nixos-anywhere ];
-
-  text = ''
-    set -euo pipefail
-
-    # Parse arguments
-    DRY_RUN=0
-    while [[ $# -gt 0 ]]; do
-      case $1 in
-        --dry-run) DRY_RUN=1; shift ;;
-        *) shift ;;
-      esac
-    done
-    export DRY_RUN
-
-    # Helpers
-    log() { echo "[$(date '+%H:%M:%S')] $*"; }
-    error() { echo "[ERROR] $*" >&2; exit 1; }
-
-    # State directory
-    STATE_DIR="''${XDG_STATE_HOME:-$HOME/.local/state}/cozystack-bootstrap"
-    mkdir -p "$STATE_DIR"
-
-    # ═══════════════════════════════════════════════════════════════
-    # Execute all phases in order
-    # ═══════════════════════════════════════════════════════════════
-    ${lib.concatMapStringsSep "\n\n" generatePhaseScript sortedPhases}
-
-    log "Bootstrap completed successfully!"
-  '';
-}
-```
-
-#### Использование в clusterConfig
-
-```nix
-{
-  clusterConfig = {
-    # ... nodeConfigurations, provisioners ...
-
-    # Пользовательские activation scripts
-    bootstrap = {
-      # Добавить скрипт в существующую фазу
-      phases.pre.activationScripts = {
-        check-network = {
-          deps = [];
-          supportsDryRun = true;
-          text = ''
-            log "Checking network connectivity..."
-            ping -c 1 google.com || error "No internet"
-          '';
-        };
-      };
-
-      # Или создать свою фазу
-      phases.custom-setup = {
-        order = 250;  # После provisioning, до kubernetes
-        activationScripts = {
-          setup-storage = {
-            deps = [];
-            text = ''
-              log "Setting up storage..."
-            '';
-          };
-        };
-      };
-
-      # Глобальные скрипты (выполняются в конце)
-      activationScripts = {
-        notify-complete = {
-          deps = [];
-          text = ''
-            curl -X POST "$SLACK_WEBHOOK" -d '{"text": "Bootstrap complete!"}'
-          '';
-        };
-      };
-    };
-  };
-}
-```
-
-#### Диаграмма: Execution Flow
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Bootstrap Execution Flow                          │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  Phase: pre (order=0)                                                │
-│  ├── check-network                                                   │
-│  └── validate-config                                                 │
-│                                                                      │
-│  Phase: discovery (order=100)                                        │
-│  ├── collect-node-state                                              │
-│  └── determine-actions                                               │
-│                                                                      │
-│  Phase: provisioning (order=200)                                     │
-│  ├── check-ssh-keys          ◄── dependency                         │
-│  ├── nixos-anywhere-provision ───┘                                  │
-│  ├── pxe-provision                                                   │
-│  └── drbd-configure          ───► depends on provisioning           │
-│                                                                      │
-│  Phase: custom-setup (order=250)  ◄── user-defined phase            │
-│  └── setup-storage                                                   │
-│                                                                      │
-│  Phase: kubernetes (order=300)                                       │
-│  ├── drbd-healthcheck                                                │
-│  ├── kubeadm-init                                                    │
-│  ├── join-control-planes                                             │
-│  └── join-workers                                                    │
-│                                                                      │
-│  Phase: cozystack (order=400)                                        │
-│  ├── wait-for-ready                                                  │
-│  └── install-cozystack                                               │
-│                                                                      │
-│  Phase: post (order=1000)                                            │
-│  ├── nixos-anywhere-cleanup                                          │
-│  └── verify-cluster                                                  │
-│                                                                      │
-│  Global scripts:                                                     │
-│  └── notify-complete                                                 │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+**Note:** First server is rebuilt last to ensure cluster availability during the update.
 
 ---
 
-## 7. Kubernetes Bootstrap
-
-### 7.1 kubeadm Configuration Generation
+## 9. flake.nix Example
 
 ```nix
-# modules/kubernetes/kubeadm.nix
-{ config, lib, pkgs, clusterConfig, ... }:
-
-let
-  cfg = clusterConfig.kubernetes;
-
-  # Collect all nodes from all provisioners
-  allNodes = lib.foldl' (acc: provName:
-    let
-      prov = clusterConfig.provisioners.${provName} or {};
-      nodes = prov.nodes or {};
-    in acc // nodes
-  ) {} (builtins.attrNames (clusterConfig.provisioners or {}));
-
-  # Resolve role from nodeConfigurations
-  resolveRole = configName:
-    let
-      resolve = name:
-        let cfg = clusterConfig.nodeConfigurations.${name}; in
-        if cfg ? role then cfg.role
-        else if cfg ? extends then resolve cfg.extends
-        else throw "No role in configuration chain: ${configName}";
-    in resolve configName;
-
-  # Get nodes with resolved roles
-  nodesWithRoles = lib.mapAttrs (n: v: v // {
-    role = resolveRole v.configuration;
-  }) allNodes;
-
-  controlPlaneNodes = lib.filterAttrs
-    (n: v: v.role == "control-plane")
-    nodesWithRoles;
-
-  firstCP = builtins.head (builtins.attrNames controlPlaneNodes);
-  firstCPNode = controlPlaneNodes.${firstCP};
-
-  # kubeadm init config for first control plane
-  initConfig = pkgs.writeText "kubeadm-init.yaml" ''
-    apiVersion: kubeadm.k8s.io/v1beta3
-    kind: InitConfiguration
-    localAPIEndpoint:
-      advertiseAddress: ${firstCPNode.ip}
-      bindPort: 6443
-    nodeRegistration:
-      criSocket: unix:///var/run/containerd/containerd.sock
-      kubeletExtraArgs:
-        node-ip: ${firstCPNode.ip}
-    ---
-    apiVersion: kubeadm.k8s.io/v1beta3
-    kind: ClusterConfiguration
-    kubernetesVersion: v${cfg.version}.0
-    clusterName: ${clusterConfig.name}
-    controlPlaneEndpoint: "${
-      if clusterConfig.ha.enabled
-      then clusterConfig.ha.loadBalancer.vip
-      else firstCPNode.ip
-    }:6443"
-    networking:
-      podSubnet: ${cfg.podCidr}
-      serviceSubnet: ${cfg.serviceCidr}
-    apiServer:
-      certSANs:
-        - "${clusterConfig.ha.loadBalancer.vip or ""}"
-        ${lib.concatMapStringsSep "\n        "
-          (n: "- \"${nodesWithRoles.${n}.ip}\"")
-          (builtins.attrNames controlPlaneNodes)}
-    etcd:
-      local:
-        dataDir: /var/lib/etcd
-    ---
-    apiVersion: kubelet.config.k8s.io/v1beta1
-    kind: KubeletConfiguration
-    cgroupDriver: systemd
-  '';
-  
-  # kubeadm join config for additional control planes
-  cpJoinConfig = ip: pkgs.writeText "kubeadm-cp-join.yaml" ''
-    apiVersion: kubeadm.k8s.io/v1beta3
-    kind: JoinConfiguration
-    discovery:
-      bootstrapToken:
-        apiServerEndpoint: "${clusterConfig.ha.loadBalancer.vip}:6443"
-        token: "PLACEHOLDER"
-        caCertHashes:
-          - "PLACEHOLDER"
-    controlPlane:
-      localAPIEndpoint:
-        advertiseAddress: ${ip}
-        bindPort: 6443
-    nodeRegistration:
-      criSocket: unix:///var/run/containerd/containerd.sock
-      kubeletExtraArgs:
-        node-ip: ${ip}
-  '';
-  
-  # kubeadm join config for workers
-  workerJoinConfig = ip: pkgs.writeText "kubeadm-worker-join.yaml" ''
-    apiVersion: kubeadm.k8s.io/v1beta3
-    kind: JoinConfiguration
-    discovery:
-      bootstrapToken:
-        apiServerEndpoint: "${
-          if clusterConfig.ha.enabled
-          then clusterConfig.ha.loadBalancer.vip
-          else firstCPNode.ip
-        }:6443"
-        token: "PLACEHOLDER"
-        caCertHashes:
-          - "PLACEHOLDER"
-    nodeRegistration:
-      criSocket: unix:///var/run/containerd/containerd.sock
-      kubeletExtraArgs:
-        node-ip: ${ip}
-  '';
-in
 {
-  inherit initConfig cpJoinConfig workerJoinConfig;
-}
-```
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    flake-parts.url = "github:hercules-ci/flake-parts";
+    nix8s.url = "github:user/nix8s";
+    disko.url = "github:nix-community/disko";
+  };
 
-### 7.2 NixOS Kubernetes Node Base
+  outputs = inputs@{ flake-parts, nix8s, ... }:
+    flake-parts.lib.mkFlake { inherit inputs; } {
+      imports = [
+        nix8s.flakeModules.default
+      ];
 
-```nix
-# modules/node/default.nix
-{ config, lib, pkgs, ... }:
+      systems = ["x86_64-linux" "aarch64-linux"];
 
-{
-  # Container runtime
-  virtualisation.containerd = {
-    enable = true;
-    settings = {
-      version = 2;
-      plugins."io.containerd.grpc.v1.cri" = {
-        sandbox_image = "registry.k8s.io/pause:3.9";
-        containerd.runtimes.runc = {
-          runtime_type = "io.containerd.runc.v2";
-          options.SystemdCgroup = true;
+      nix8s = {
+        nodes = {
+          standard = {
+            network.mac = "aa:bb:cc:dd:ee:01";
+            install.disk = "/dev/sda";
+          };
+        };
+
+        clusters.dev = {
+          k3s.version = "v1.31.0+k3s1";
+
+          secrets = import ./secrets/dev.nix;
+
+          members = {
+            server = { node = "standard"; role = "server"; ip = "192.168.1.10"; };
+            agent = { node = "standard"; role = "agent"; ip = "192.168.1.20"; };
+          };
+        };
+
+        provisioning.nixos-anywhere.ssh = {
+          user = "root";
+          keyFile = "/home/user/.ssh/id_ed25519";
         };
       };
     };
-  };
-
-  # Kubernetes packages
-  environment.systemPackages = with pkgs; [
-    kubernetes
-    kubectl
-    kubeadm
-    kubelet
-    cni-plugins
-    crictl
-    ethtool
-    socat
-    conntrack-tools
-  ];
-
-  # Kernel modules for k8s
-  boot.kernelModules = [
-    "br_netfilter"
-    "ip_vs"
-    "ip_vs_rr"
-    "ip_vs_wrr"
-    "ip_vs_sh"
-    "overlay"
-  ];
-
-  boot.kernel.sysctl = {
-    "net.bridge.bridge-nf-call-iptables" = 1;
-    "net.bridge.bridge-nf-call-ip6tables" = 1;
-    "net.ipv4.ip_forward" = 1;
-  };
-
-  # Kubelet service (managed by kubeadm)
-  systemd.services.kubelet = {
-    description = "Kubernetes Kubelet";
-    wantedBy = [ "multi-user.target" ];
-    after = [ "containerd.service" ];
-    
-    serviceConfig = {
-      ExecStart = ''
-        ${pkgs.kubernetes}/bin/kubelet \
-          --config=/var/lib/kubelet/config.yaml \
-          --kubeconfig=/etc/kubernetes/kubelet.conf \
-          --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf \
-          --container-runtime-endpoint=unix:///var/run/containerd/containerd.sock
-      '';
-      Restart = "always";
-      RestartSec = "10s";
-    };
-  };
-
-  # Disable swap (required for k8s)
-  swapDevices = lib.mkForce [];
-
-  # Firewall rules for k8s
-  networking.firewall = {
-    allowedTCPPorts = [
-      6443  # API server
-      2379 2380  # etcd
-      10250 10251 10252  # kubelet, scheduler, controller
-      10255  # kubelet read-only
-      30000  # NodePort range start
-    ];
-    allowedTCPPortRanges = [
-      { from = 30000; to = 32767; }  # NodePort range
-    ];
-  };
-}
-```
-
-### 7.3 Control Plane Node
-
-```nix
-# modules/node/control-plane.nix
-{ config, lib, pkgs, clusterConfig, nodeName, allNodes, ... }:
-
-let
-  # allNodes is passed from mkNodeConfig with resolved roles
-  controlPlaneNodes = lib.filterAttrs (n: v: v.role == "control-plane") allNodes;
-  isFirstCP = nodeName == builtins.head (builtins.attrNames controlPlaneNodes);
-in
-{
-  imports = [ ./default.nix ];
-
-  # Additional control plane firewall rules
-  networking.firewall.allowedTCPPorts = [
-    2379 2380  # etcd client & peer
-    10257      # kube-controller-manager
-    10259      # kube-scheduler
-  ];
-
-  # etcd data directory on separate disk if configured
-  fileSystems."/var/lib/etcd" = lib.mkIf (config.nodeConfig.disks ? etcd) {
-    device = config.nodeConfig.disks.etcd;
-    fsType = "ext4";
-    options = [ "noatime" "data=ordered" ];
-  };
-
-  # kube-vip for HA (if enabled)
-  systemd.services.kube-vip = lib.mkIf clusterConfig.ha.enabled {
-    description = "kube-vip";
-    wantedBy = [ "multi-user.target" ];
-    after = [ "network.target" ];
-    
-    serviceConfig = {
-      ExecStart = ''
-        ${pkgs.kube-vip}/bin/kube-vip manager \
-          --interface ${clusterConfig.ha.loadBalancer.interface} \
-          --address ${clusterConfig.ha.loadBalancer.vip} \
-          --controlplane \
-          --arp \
-          --leaderElection
-      '';
-      Restart = "always";
-    };
-  };
 }
 ```
 
 ---
 
-## 8. Bootstrap Script
+## 10. Secrets Management
 
-> **Ключевой принцип:** Bootstrap состоит из **независимых reconciler loops**,
-> которые работают параллельно и общаются через **shared state directory**.
-> Каждый модуль (provisioner, k8s, cozystack, extensions) **регистрирует свой reconciler**.
+### 10.1 Architecture
 
-### 8.1 Modular Reconciler Architecture
+Secrets (k3s tokens) are pre-generated and stored encrypted in git using SOPS.
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                  Modular Reconciler Architecture                     │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  Каждый модуль регистрирует свой reconciler через extensible system: │
-│                                                                      │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │         bootstrap.reconcilers = { ... }            │    │
-│  │                                                              │    │
-│  │  Modules register themselves:                                │    │
-│  │  • provisioners/nixos-anywhere.nix → reconcilers.nixos-anywhere│   │
-│  │  • provisioners/pxe.nix           → reconcilers.pxe          │    │
-│  │  • provisioners/terraform.nix     → reconcilers.terraform    │    │
-│  │  • kubernetes/joiner.nix          → reconcilers.k8s-joiner   │    │
-│  │  • cozystack/installer.nix        → reconcilers.cozystack    │    │
-│  │  • extensions/drbd.nix            → reconcilers.drbd         │    │
-│  │                                                              │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-│                            │                                         │
-│                            ▼                                         │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │              Shared State Directory ($STATE_DIR)             │    │
-│  │                                                              │    │
-│  │  nodes/                     cluster/           reconcilers/  │    │
-│  │  ├── cp1/                   ├── kubeconfig     ├── nixos-... │    │
-│  │  │   ├── desired.json       ├── join-token     ├── pxe.pid   │    │
-│  │  │   ├── state              ├── ca-hash        ├── k8s.pid   │    │
-│  │  │   └── provisioner        └── cozystack/     └── cozy.pid  │    │
-│  │  └── worker1/                   └── state                    │    │
-│  │      └── ...                                                 │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-│        ▲              ▲              ▲              ▲                │
-│        │              │              │              │                │
-│  ┌─────┴─────┐  ┌─────┴─────┐  ┌─────┴─────┐  ┌─────┴─────┐        │
-│  │Provisioner│  │Provisioner│  │   K8s     │  │ Cozystack │        │
-│  │ nixos-    │  │   pxe     │  │  Joiner   │  │ Installer │        │
-│  │ anywhere  │  │           │  │           │  │           │        │
-│  └───────────┘  └───────────┘  └───────────┘  └───────────┘        │
-│                                                                      │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │                    Extension Reconcilers                      │    │
-│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐                       │    │
-│  │  │  DRBD   │  │   GPU   │  │ Custom  │  (conditional)        │    │
-│  │  │ Watcher │  │  Setup  │  │         │                       │    │
-│  │  └─────────┘  └─────────┘  └─────────┘                       │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                    Secrets Flow                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. nix run .#gen-secrets -- <cluster-name>                     │
+│     └── Generates secrets/cluster.nix (plaintext)              │
+│                                                                  │
+│  2. sops --encrypt --in-place secrets/cluster.nix              │
+│     └── Encrypts file in place                                  │
+│                                                                  │
+│  3. git add --force secrets/cluster.nix                         │
+│     └── .gitignore blocks plaintext, force-add encrypted       │
+│                                                                  │
+│  4. clusters.prod.secrets = import ./secrets/prod.nix;          │
+│     └── sops-nix decrypts at eval time                         │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### 8.2 Reconciler Registration Interface
-
-Модули регистрируют свои reconcilers через стандартный интерфейс:
+### 10.2 Generated Secrets (k3s)
 
 ```nix
-# lib/reconciler.nix
-{ lib }:
-
+# secrets/prod.nix (after generation, before encryption)
 {
-  # Тип для reconciler
-  reconcilerType = lib.types.submodule {
-    options = {
-      # Условие запуска (e.g., только если есть ноды для этого provisioner)
-      enable = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-      };
+  # Main token — for servers to join/init cluster
+  token = "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5bC7dE9fG";
 
-      # Зависимости от других reconcilers (для порядка запуска)
-      after = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        default = [];
-        description = "Start after these reconcilers";
-      };
-
-      # Reconciler script package
-      package = lib.mkOption {
-        type = lib.types.package;
-        description = "Reconciler executable";
-      };
-
-      # Интервал reconcile loop (секунды)
-      interval = lib.mkOption {
-        type = lib.types.int;
-        default = 30;
-      };
-
-      # Watch mode: файлы/директории для inotify
-      watchPaths = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        default = [];
-        description = "Paths to watch for changes (triggers immediate reconcile)";
-      };
-    };
-  };
+  # Agent token — for agents only (recommended for production)
+  agentToken = "xY3zA5bC7dE9fG1hJ3kL5mN7pQ9rS1tU3vW5xY7zA9bC";
 }
 ```
 
-```nix
-# modules/bootstrap/reconcilers.nix
-{ config, lib, pkgs, ... }:
-
-let
-  reconcilerLib = import ../../lib/reconciler.nix { inherit lib; };
-in
-{
-  options.bootstrap.reconcilers = lib.mkOption {
-    type = lib.types.attrsOf reconcilerLib.reconcilerType;
-    default = {};
-    description = "Registered reconcilers";
-  };
-}
-```
-
-### 8.3 Node State Machine
-
-```
-┌──────────┐     provision      ┌─────────────┐    kubeadm     ┌────────┐
-│ pending  │ ─────────────────▶ │ provisioned │ ────join────▶  │ joined │
-└──────────┘                    └─────────────┘                └────┬───┘
-     ▲                                                              │
-     │                                                         kubectl
-     │         ┌────────────────────────────────────────────┐  get node
-     │         │                                            │  Ready=True
-     │         ▼                                            ▼
-     │    ┌─────────┐                                  ┌────────┐
-     └────│  error  │                                  │  ready │
-          └─────────┘                                  └────────┘
-                │
-                └── retry after backoff
-```
-
-**State transitions:**
-| From | To | Trigger | Actor |
-|------|-----|---------|-------|
-| pending | provisioned | NixOS installed, SSH works | provisioner |
-| provisioned | joined | `kubeadm join` succeeded | k8s-joiner |
-| joined | ready | `kubectl get node` shows Ready | k8s-joiner |
-| any | error | failure | any |
-| error | pending | manual reset or auto-retry | operator |
-
-### 8.4 Main Orchestrator
-
-Главный скрипт **динамически запускает зарегистрированные reconcilers**:
-
-```nix
-# apps/bootstrap/default.nix
-{ pkgs, lib, config, clusterConfig, ... }:
-
-let
-  cfg = config.bootstrap;
-
-  inherit (import ./lib.nix { inherit lib clusterConfig; })
-    allNodes nodesWithRoles;
-
-  # Топологическая сортировка reconcilers по зависимостям
-  sortedReconcilers = let
-    enabled = lib.filterAttrs (n: v: v.enable) cfg.reconcilers;
-    names = builtins.attrNames enabled;
-
-    # Simple topological sort
-    visit = visited: name:
-      if builtins.elem name visited then visited
-      else let
-        deps = enabled.${name}.after or [];
-        visitedWithDeps = builtins.foldl' visit visited deps;
-      in visitedWithDeps ++ [ name ];
-
-  in builtins.foldl' visit [] names;
-
-in pkgs.writeShellApplication {
-  name = "bootstrap-cluster";
-
-  runtimeInputs = with pkgs; [ coreutils jq ]
-    ++ (lib.mapAttrsToList (n: v: v.package) (lib.filterAttrs (n: v: v.enable) cfg.reconcilers));
-
-  text = ''
-    set -euo pipefail
-
-    STATE_DIR="''${XDG_STATE_HOME:-$HOME/.local/state}/cozystack-bootstrap/${clusterConfig.name}"
-    mkdir -p "$STATE_DIR"/{nodes,cluster,reconcilers}
-    export STATE_DIR
-
-    log() { echo "[$(date '+%H:%M:%S')] $1"; }
-
-    # ═══════════════════════════════════════════════════════════
-    # Initialize desired state
-    # ═══════════════════════════════════════════════════════════
-    init_desired_state() {
-      log "Initializing desired state..."
-
-      ${lib.concatMapStrings (name: let
-        node = nodesWithRoles.${name};
-      in ''
-        mkdir -p "$STATE_DIR/nodes/${name}"
-        cat > "$STATE_DIR/nodes/${name}/desired.json" << 'EOF'
-${builtins.toJSON {
-  inherit name;
-  inherit (node) ip role provisioner configuration;
-  ssh = node.ssh or {};
-}}
-EOF
-        [[ -f "$STATE_DIR/nodes/${name}/state" ]] || echo "pending" > "$STATE_DIR/nodes/${name}/state"
-        echo "${node.provisioner}" > "$STATE_DIR/nodes/${name}/provisioner"
-      '') (builtins.attrNames nodesWithRoles)}
-    }
-
-    # ═══════════════════════════════════════════════════════════
-    # Start all registered reconcilers (sorted by dependencies)
-    # ═══════════════════════════════════════════════════════════
-    start_reconcilers() {
-      log "Starting reconcilers..."
-
-      ${lib.concatMapStringsSep "\n" (name: let
-        rec = cfg.reconcilers.${name};
-      in lib.optionalString rec.enable ''
-        log "  Starting ${name}..."
-        STATE_DIR="$STATE_DIR" RECONCILE_INTERVAL=${toString rec.interval} \
-          ${rec.package}/bin/* &
-        echo $! > "$STATE_DIR/reconcilers/${name}.pid"
-        log "    ${name} started (PID: $!)"
-      '') sortedReconcilers}
-
-      log "All reconcilers started (${toString (builtins.length sortedReconcilers)} total)"
-    }
-
-    # ═══════════════════════════════════════════════════════════
-    # Wait for convergence
-    # ═══════════════════════════════════════════════════════════
-    wait_for_convergence() {
-      log "Waiting for cluster convergence..."
-
-      local timeout=''${TIMEOUT:-3600}
-      local start_time=$(date +%s)
-
-      while true; do
-        local all_nodes_ready=true
-        local status=""
-
-        # Check nodes
-        for node_dir in "$STATE_DIR"/nodes/*/; do
-          local node=$(basename "$node_dir")
-          local state=$(cat "$node_dir/state" 2>/dev/null || echo "unknown")
-          status+=" $node:$state"
-          [[ "$state" == "ready" ]] || all_nodes_ready=false
-        done
-
-        # Check cozystack
-        local cozy_state=$(cat "$STATE_DIR/cluster/cozystack/state" 2>/dev/null || echo "pending")
-
-        log "Nodes:$status | cozystack:$cozy_state"
-
-        if $all_nodes_ready && [[ "$cozy_state" == "ready" ]]; then
-          log "✓ Cluster converged!"
-          return 0
-        fi
-
-        # Timeout check
-        local elapsed=$(($(date +%s) - start_time))
-        if [[ $elapsed -gt $timeout ]]; then
-          log "ERROR: Timeout ($timeout s)"
-          return 1
-        fi
-
-        sleep 10
-      done
-    }
-
-    # ═══════════════════════════════════════════════════════════
-    # Cleanup
-    # ═══════════════════════════════════════════════════════════
-    cleanup() {
-      log "Stopping reconcilers..."
-      for pid_file in "$STATE_DIR"/reconcilers/*.pid; do
-        [[ -f "$pid_file" ]] && kill "$(cat "$pid_file")" 2>/dev/null || true
-      done
-    }
-    trap cleanup EXIT
-
-    # ═══════════════════════════════════════════════════════════
-    # Main
-    # ═══════════════════════════════════════════════════════════
-    main() {
-      log "═══════════════════════════════════════════════════════════"
-      log "Bootstrap: ${clusterConfig.name}"
-      log "Nodes: ${toString (builtins.length (builtins.attrNames nodesWithRoles))}"
-      log "Reconcilers: ${lib.concatStringsSep ", " sortedReconcilers}"
-      log "═══════════════════════════════════════════════════════════"
-
-      init_desired_state
-      start_reconcilers
-      wait_for_convergence
-
-      echo ""
-      log "Kubeconfig: $STATE_DIR/cluster/kubeconfig"
-      log "export KUBECONFIG=$STATE_DIR/cluster/kubeconfig"
-    }
-
-    main "$@"
-  '';
-}
-```
-
-### 8.5 Provisioner Reconciler (nixos-anywhere)
-
-Provisioner владеет директориями `$STATE_DIR/nodes/<name>/`. Создаёт `config.json` после успешного provision:
-
-```nix
-# apps/reconcilers/nixos-anywhere.nix
-{ pkgs, lib, clusterConfig, ... }:
-
-let
-  provCfg = clusterConfig.provisioners.nixos-anywhere or {};
-  nodes = provCfg.nodes or {};
-  defaults = provCfg.defaults or {};
-in pkgs.writeShellApplication {
-  name = "nixos-anywhere-reconciler";
-
-  runtimeInputs = with pkgs; [ nixos-anywhere openssh jq ];
-
-  text = ''
-    set -euo pipefail
-
-    STATE_DIR="''${STATE_DIR:?STATE_DIR required}"
-    RECONCILE_INTERVAL=''${RECONCILE_INTERVAL:-30}
-
-    log() { echo "[nixos-anywhere] $(date '+%H:%M:%S') $1"; }
-
-    # ═══════════════════════════════════════════════════════════
-    # Desired nodes from config (baked at build time)
-    # ═══════════════════════════════════════════════════════════
-    declare -A DESIRED_NODES
-    ${lib.concatStrings (lib.mapAttrsToList (name: cfg: ''
-      DESIRED_NODES[${name}]='${builtins.toJSON {
-        ip = cfg.ssh.host or cfg.ip;
-        role = cfg.role or "worker";
-      }}'
-    '') nodes)}
-
-    # ═══════════════════════════════════════════════════════════
-    # Provision single node
-    # ═══════════════════════════════════════════════════════════
-    provision_node() {
-      local node="$1"
-      local node_dir="$STATE_DIR/nodes/$node"
-      local config="''${DESIRED_NODES[$node]}"
-
-      local ssh_host=$(echo "$config" | jq -r '.ip')
-      local ssh_key="${toString (defaults.ssh.keyFile or "")}"
-
-      log "Provisioning $node ($ssh_host)..."
-
-      if nixos-anywhere \
-        --flake ".#$node" \
-        --target-host "root@$ssh_host" \
-        ''${ssh_key:+--ssh-option "IdentityFile=$ssh_key"} \
-        --build-on-remote; then
-
-        log "$node provisioned successfully"
-
-        # Create node directory with config.json
-        mkdir -p "$node_dir"
-        echo "$config" > "$node_dir/config.json"
-      else
-        log "ERROR: Failed to provision $node"
-      fi
-    }
-
-    # ═══════════════════════════════════════════════════════════
-    # Reconcile
-    # ═══════════════════════════════════════════════════════════
-    reconcile() {
-      # Provision nodes that don't exist yet
-      for node in "''${!DESIRED_NODES[@]}"; do
-        if [[ ! -f "$STATE_DIR/nodes/$node/config.json" ]]; then
-          provision_node "$node"
-        fi
-      done
-
-      # Remove nodes that are no longer in config
-      for node_dir in "$STATE_DIR/nodes"/*/; do
-        [[ -d "$node_dir" ]] || continue
-        local node=$(basename "$node_dir")
-
-        # Skip if not our node (check by existence in DESIRED_NODES)
-        [[ -v "DESIRED_NODES[$node]" ]] || continue
-
-        # Node removed from config? Delete directory
-        if [[ ! -v "DESIRED_NODES[$node]" ]]; then
-          log "Node $node removed from config, cleaning up..."
-          rm -rf "$node_dir"
-        fi
-      done
-    }
-
-    # ═══════════════════════════════════════════════════════════
-    # Main loop
-    # ═══════════════════════════════════════════════════════════
-    log "Starting reconciler (interval: ''${RECONCILE_INTERVAL}s)"
-
-    mkdir -p "$STATE_DIR/pids"
-    echo $$ > "$STATE_DIR/pids/nixos-anywhere.pid"
-    trap 'rm -f "$STATE_DIR/pids/nixos-anywhere.pid"' EXIT
-
-    while true; do
-      reconcile
-      sleep "$RECONCILE_INTERVAL"
-    done
-  '';
-}
-```
-
-### 8.6 K8s Node Joiner Reconciler
-
-Следит за `$STATE_DIR/nodes/` и управляет `$STATE_DIR/k8s/`:
-
-```nix
-# apps/reconcilers/k8s-joiner.nix
-{ pkgs, lib, clusterConfig, ... }:
-
-let
-  inherit (import ./lib.nix { inherit lib clusterConfig; })
-    controlPlaneNodes workerNodes firstCP;
-
-  apiEndpoint = if clusterConfig.ha.enabled
-    then clusterConfig.ha.loadBalancer.vip
-    else controlPlaneNodes.${firstCP}.ip;
-
-  sshKey = clusterConfig.ssh.keyFile or "";
-in pkgs.writeShellApplication {
-  name = "k8s-joiner-reconciler";
-
-  runtimeInputs = with pkgs; [ openssh kubectl jq ];
-
-  text = ''
-    set -euo pipefail
-
-    STATE_DIR="''${STATE_DIR:?STATE_DIR required}"
-    RECONCILE_INTERVAL=''${RECONCILE_INTERVAL:-15}
-    K8S_DIR="$STATE_DIR/k8s"
-    SSH_KEY="${sshKey}"
-
-    log() { echo "[k8s-joiner] $(date '+%H:%M:%S') $1"; }
-
-    ssh_cmd() {
-      local host="$1"; shift
-      ssh -o StrictHostKeyChecking=no ''${SSH_KEY:+-i "$SSH_KEY"} "root@$host" "$@"
-    }
-
-    # ═══════════════════════════════════════════════════════════
-    # Initialize cluster (first control plane)
-    # ═══════════════════════════════════════════════════════════
-    init_cluster() {
-      mkdir -p "$K8S_DIR/members"
-
-      [[ -f "$K8S_DIR/initialized" ]] && return 0
-
-      local first_cp="${firstCP}"
-
-      # Wait for first CP to be provisioned
-      if [[ ! -f "$STATE_DIR/nodes/$first_cp/config.json" ]]; then
-        log "Waiting for first CP ($first_cp) to be provisioned..."
-        return 1
-      fi
-
-      local ssh_host=$(jq -r '.ip' "$STATE_DIR/nodes/$first_cp/config.json")
-
-      log "Initializing cluster on $first_cp ($ssh_host)..."
-
-      if ssh_cmd "$ssh_host" "kubeadm init --config /etc/kubernetes/kubeadm-init.yaml --upload-certs"; then
-        # Save credentials
-        ssh_cmd "$ssh_host" "kubeadm token create" > "$K8S_DIR/join-token"
-        ssh_cmd "$ssh_host" \
-          "openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'" \
-          > "$K8S_DIR/ca-hash"
-        ssh_cmd "$ssh_host" \
-          "kubeadm init phase upload-certs --upload-certs 2>/dev/null | tail -1" \
-          > "$K8S_DIR/cert-key"
-        ssh_cmd "$ssh_host" "cat /etc/kubernetes/admin.conf" > "$K8S_DIR/kubeconfig"
-
-        touch "$K8S_DIR/initialized"
-        touch "$K8S_DIR/members/$first_cp"
-        log "Cluster initialized!"
-      else
-        log "ERROR: kubeadm init failed"
-        return 1
-      fi
-    }
-
-    # ═══════════════════════════════════════════════════════════
-    # Join node to cluster
-    # ═══════════════════════════════════════════════════════════
-    join_node() {
-      local node="$1"
-      local config=$(cat "$STATE_DIR/nodes/$node/config.json")
-      local ssh_host=$(echo "$config" | jq -r '.ip')
-      local role=$(echo "$config" | jq -r '.role // "worker"')
-
-      local join_token=$(cat "$K8S_DIR/join-token")
-      local ca_hash=$(cat "$K8S_DIR/ca-hash")
-
-      log "Joining $node ($ssh_host) as $role..."
-
-      local join_cmd="kubeadm join ${apiEndpoint}:6443 --token $join_token --discovery-token-ca-cert-hash sha256:$ca_hash"
-
-      if [[ "$role" == "control-plane" ]]; then
-        local cert_key=$(cat "$K8S_DIR/cert-key")
-        join_cmd+=" --control-plane --certificate-key $cert_key"
-      fi
-
-      if ssh_cmd "$ssh_host" "$join_cmd"; then
-        touch "$K8S_DIR/members/$node"
-        log "$node joined successfully"
-      else
-        log "ERROR: Failed to join $node"
-      fi
-    }
-
-    # ═══════════════════════════════════════════════════════════
-    # Drain and delete node from cluster
-    # ═══════════════════════════════════════════════════════════
-    remove_node() {
-      local node="$1"
-      export KUBECONFIG="$K8S_DIR/kubeconfig"
-
-      log "Removing $node from cluster..."
-
-      kubectl drain "$node" --ignore-daemonsets --delete-emptydir-data --force 2>/dev/null || true
-      kubectl delete node "$node" 2>/dev/null || true
-      rm -f "$K8S_DIR/members/$node"
-
-      log "$node removed"
-    }
-
-    # ═══════════════════════════════════════════════════════════
-    # Reconcile
-    # ═══════════════════════════════════════════════════════════
-    reconcile() {
-      # Initialize cluster first
-      if ! init_cluster; then
-        return
-      fi
-
-      # Join new nodes
-      for node_dir in "$STATE_DIR/nodes"/*/; do
-        [[ -d "$node_dir" ]] || continue
-        local node=$(basename "$node_dir")
-
-        # Already joined?
-        [[ -f "$K8S_DIR/members/$node" ]] && continue
-
-        # Node provisioned? Join it
-        if [[ -f "$node_dir/config.json" ]]; then
-          join_node "$node"
-        fi
-      done
-
-      # Remove deleted nodes
-      for member in "$K8S_DIR/members"/*; do
-        [[ -f "$member" ]] || continue
-        local node=$(basename "$member")
-
-        # Node removed from nodes/?
-        if [[ ! -d "$STATE_DIR/nodes/$node" ]]; then
-          remove_node "$node"
-        fi
-      done
-    }
-
-    # ═══════════════════════════════════════════════════════════
-    # Main loop
-    # ═══════════════════════════════════════════════════════════
-    log "Starting k8s-joiner reconciler"
-
-    mkdir -p "$STATE_DIR/pids"
-    echo $$ > "$STATE_DIR/pids/k8s-joiner.pid"
-    trap 'rm -f "$STATE_DIR/pids/k8s-joiner.pid"' EXIT
-
-    while true; do
-      reconcile
-      sleep "$RECONCILE_INTERVAL"
-    done
-  '';
-}
-```
-
-### 8.7 Cozystack Module (Registers Own Reconciler)
-
-Cozystack — отдельный модуль, который регистрирует свой reconciler:
-
-```nix
-# modules/cozystack/default.nix
-{ config, lib, pkgs, clusterConfig, ... }:
-
-let
-  cozyCfg = clusterConfig.cozystack or {};
-
-  cozystackReconciler = pkgs.writeShellApplication {
-    name = "cozystack-reconciler";
-
-    runtimeInputs = with pkgs; [ kubectl helm jq ];
-
-    text = ''
-      set -euo pipefail
-
-      STATE_DIR="''${STATE_DIR:?STATE_DIR required}"
-      RECONCILE_INTERVAL=''${RECONCILE_INTERVAL:-30}
-      COZY_DIR="$STATE_DIR/cozystack"
-
-      log() { echo "[cozystack] $(date '+%H:%M:%S') $1"; }
-
-      # ═══════════════════════════════════════════════════════════
-      # Check if cluster is ready
-      # ═══════════════════════════════════════════════════════════
-      cluster_ready() {
-        [[ -f "$STATE_DIR/k8s/kubeconfig" ]] || return 1
-
-        # Check at least one node joined
-        local members=$(ls "$STATE_DIR/k8s/members" 2>/dev/null | wc -l)
-        [[ "$members" -gt 0 ]]
-      }
-
-      # ═══════════════════════════════════════════════════════════
-      # Install/Upgrade Cozystack
-      # ═══════════════════════════════════════════════════════════
-      install_cozystack() {
-        export KUBECONFIG="$STATE_DIR/k8s/kubeconfig"
-
-        local desired_version="${cozyCfg.version or "latest"}"
-
-        if [[ -f "$COZY_DIR/installed" ]]; then
-          # Already installed, check health
-          local not_running=$(kubectl get pods -n cozystack-system --no-headers 2>/dev/null | grep -cv "Running\|Completed" || echo "999")
-
-          if [[ "$not_running" -eq 0 ]]; then
-            return 0
-          else
-            log "Cozystack degraded: $not_running pods not running"
-          fi
-          return 0
-        fi
-
-        log "Installing Cozystack (version: $desired_version)..."
-
-        helm repo add cozystack https://cozystack.io/charts 2>/dev/null || true
-        helm repo update
-
-        local version_flag=""
-        [[ "$desired_version" != "latest" ]] && version_flag="--version $desired_version"
-
-        if helm install cozystack cozystack/cozystack \
-          --namespace cozystack-system \
-          --create-namespace \
-          $version_flag \
-          --wait \
-          --timeout 15m; then
-
-          touch "$COZY_DIR/installed"
-          echo "$desired_version" > "$COZY_DIR/version"
-          log "Cozystack installed successfully!"
-        else
-          log "ERROR: Cozystack installation failed"
-        fi
-      }
-
-      # ═══════════════════════════════════════════════════════════
-      # Reconcile
-      # ═══════════════════════════════════════════════════════════
-      reconcile() {
-        if ! cluster_ready; then
-          log "Waiting for cluster to be ready..."
-          return
-        fi
-
-        install_cozystack
-      }
-
-      # ═══════════════════════════════════════════════════════════
-      # Main loop
-      # ═══════════════════════════════════════════════════════════
-      log "Starting cozystack reconciler (interval: ''${RECONCILE_INTERVAL}s)"
-
-      mkdir -p "$COZY_DIR" "$STATE_DIR/pids"
-      echo $$ > "$STATE_DIR/pids/cozystack.pid"
-      trap 'rm -f "$STATE_DIR/pids/cozystack.pid"' EXIT
-
-      while true; do
-        reconcile
-        sleep "$RECONCILE_INTERVAL"
-      done
-    '';
-  };
-
-in {
-  bootstrap.reconcilers.cozystack = {
-    enable = true;
-    after = [ "k8s-joiner" ];
-    package = cozystackReconciler;
-    interval = 30;
-    watchPaths = [
-      "$STATE_DIR/k8s/kubeconfig"
-      "$STATE_DIR/k8s/members"
-    ];
-  };
-}
-```
-
-### 8.8 PXE Reconciler
-
-PXE reconciler слушает callback от загрузившихся машин и создаёт `nodes/<name>/config.json`:
-
-```nix
-# apps/reconcilers/pxe.nix
-{ pkgs, lib, clusterConfig, ... }:
-
-let
-  pxeCfg = clusterConfig.provisioners.pxe or {};
-  defaultRole = pxeCfg.defaults.role or "worker";
-in pkgs.writeShellApplication {
-  name = "pxe-reconciler";
-
-  runtimeInputs = with pkgs; [ ncat jq ];
-
-  text = ''
-    set -euo pipefail
-
-    STATE_DIR="''${STATE_DIR:?STATE_DIR required}"
-    CALLBACK_PORT=''${CALLBACK_PORT:-9999}
-
-    log() { echo "[pxe] $(date '+%H:%M:%S') $1"; }
-
-    # ═══════════════════════════════════════════════════════════
-    # Handle callback from booted node
-    # ═══════════════════════════════════════════════════════════
-    handle_callback() {
-      local mac="$1"
-      local ip="$2"
-
-      log "Callback from MAC=$mac IP=$ip"
-
-      # Generate node name from MAC
-      local node="pxe-''${mac//:/-}"
-      local node_dir="$STATE_DIR/nodes/$node"
-
-      # Already provisioned?
-      if [[ -f "$node_dir/config.json" ]]; then
-        log "Node $node already exists, updating IP"
-        # Update IP if changed (DHCP)
-        local old_ip=$(jq -r '.ip' "$node_dir/config.json")
-        if [[ "$old_ip" != "$ip" ]]; then
-          jq ".ip = \"$ip\"" "$node_dir/config.json" > "$node_dir/config.json.tmp"
-          mv "$node_dir/config.json.tmp" "$node_dir/config.json"
-        fi
-        return 0
-      fi
-
-      # Create new node
-      log "New node discovered: $node"
-      mkdir -p "$node_dir"
-
-      cat > "$node_dir/config.json" <<EOF
-    {
-      "ip": "$ip",
-      "role": "${defaultRole}",
-      "mac": "$mac",
-      "discovered": true
-    }
-    EOF
-    }
-
-    # ═══════════════════════════════════════════════════════════
-    # Listen for callbacks
-    # ═══════════════════════════════════════════════════════════
-    listen_callbacks() {
-      log "Listening for PXE callbacks on port $CALLBACK_PORT..."
-
-      while true; do
-        # Simple callback protocol: "MAC IP"
-        local callback=$(nc -l -p "$CALLBACK_PORT" -q 1 || true)
-        if [[ -n "$callback" ]]; then
-          local mac=$(echo "$callback" | cut -d' ' -f1)
-          local ip=$(echo "$callback" | cut -d' ' -f2)
-          handle_callback "$mac" "$ip"
-        fi
-      done
-    }
-
-    # ═══════════════════════════════════════════════════════════
-    # Main
-    # ═══════════════════════════════════════════════════════════
-    mkdir -p "$STATE_DIR/pids"
-    echo $$ > "$STATE_DIR/pids/pxe.pid"
-    trap 'rm -f "$STATE_DIR/pids/pxe.pid"' EXIT
-
-    start_pxe_server
-    listen_callbacks
-  '';
-}
-```
-
-### 8.9 State Directory Structure
-
-См. секцию 3.9 для полного описания. Краткая структура:
-
-```
-$STATE_DIR/
-├── nodes/                    # Provisioners владеют (создают/удаляют)
-│   └── <node>/config.json    # {ip, role, mac?}
-│
-├── k8s/                      # k8s-joiner владеет
-│   ├── kubeconfig
-│   └── members/<node>        # Ноды в кластере
-│
-├── cozystack/                # cozystack reconciler владеет
-│   └── installed
-│
-└── pids/                     # PID файлы
-    └── *.pid
-```
-
-### 8.10 Sequence Diagram
-
-```
-Time
- │
- │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
- │  │nixos-anywhere│ │     pxe      │ │  k8s-joiner  │ │  cozystack   │
- │  └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
- │         │                │                │                │
- ▼         │                │                │ wait for       │ wait for
-           │ provision cp1  │                │ nodes/*/       │ k8s/
-           │                │                │ config.json    │ kubeconfig
-           │                │                │                │
-           │ creates:       │                │                │
-           │ nodes/cp1/     │                │                │
-           │ config.json    │                │                │
-           │───────────────────────────────▶ │                │
-           │                │                │ kubeadm init   │
-           │                │                │ creates:       │
-           │                │                │ k8s/kubeconfig │
-           │                │                │ k8s/members/cp1│
-           │                │                │                │
-           │ provision      │ callback       │                │
-           │ worker1        │ worker2 boots  │                │
-           │                │                │                │
-           │ creates:       │ creates:       │                │
-           │ nodes/worker1/ │ nodes/pxe-xx/  │                │
-           │ config.json    │ config.json    │                │
-           │───────────────────────────────▶ │                │
-           │                │───────────────▶│                │
-           │                │                │ kubeadm join   │
-           │                │                │ both workers   │
-           │                │                │───────────────▶│
-           │                │                │                │ sees:
-           │                │                │                │ k8s/kubeconfig
-           │                │                │                │ k8s/members/*
-           │                │                │                │
-           │                │                │                │ helm install
-           │                │                │                │ cozystack
-           │                │                │                │
-           ▼                ▼                ▼                ▼ CONVERGED!
-```
-
-Каждый reconciler watch'ит только нужные ему директории и пишет только в свою.
-
----
-
-## 9. Idempotency Design
-
-### 9.1 State Machine
-
-```
-┌─────────────────┐
-│   UNPROVISIONED │ ─── provision_nodes() ──▶ ┌─────────────┐
-└─────────────────┘                           │ PROVISIONED │
-                                              └──────┬──────┘
-                                                     │
-                                          init_first_cp()
-                                                     │
-                                                     ▼
-┌─────────────────┐                           ┌─────────────┐
-│  CLUSTER_READY  │ ◀── install_cozystack() ──│  K8S_READY  │
-└─────────────────┘                           └─────────────┘
-```
-
-### 9.2 Idempotency Checks
-
-| Step | Check | Recovery |
-|------|-------|----------|
-| Provision node | SSH connectivity + NixOS version | Skip if matching |
-| kubeadm init | `/etc/kubernetes/admin.conf` exists | Reuse existing |
-| kubeadm join | Node in `kubectl get nodes` | Skip |
-| Cozystack | Helm release exists | Upgrade if needed |
-
-### 9.3 State File Structure
-
-```
-~/.local/state/cozystack-bootstrap/prod-cluster/
-├── provision-cp1.done
-├── provision-cp2.done
-├── provision-cp3.done
-├── provision-worker1.done
-├── provision-worker2.done
-├── kubeadm-init.done
-├── join-cp-cp2.done
-├── join-cp-cp3.done
-├── join-worker-worker1.done
-├── join-worker-worker2.done
-├── cozystack-install.done
-├── kubeconfig
-├── join-token
-├── ca-hash
-└── cert-key
-```
-
----
-
-## 10. CLI Interface
-
-### 10.1 Available Commands
+### 10.3 Usage
 
 ```bash
-# Full bootstrap (default)
-nix run .#bootstrap
+# Generate secrets for cluster
+nix run .#gen-secrets -- prod
 
-# Individual phases
-nix run .#bootstrap -- --phase provision
-nix run .#bootstrap -- --phase kubernetes
-nix run .#bootstrap -- --phase cozystack
+# Encrypt with sops
+sops --encrypt --in-place secrets/prod.nix
 
-# Single node operations
-nix run .#deploy-cp1
-nix run .#rebuild-worker1
+# Verify encryption
+head -1 secrets/prod.nix | grep -q "sops" && echo "OK" || echo "NOT ENCRYPTED!"
 
-# Cluster management
-nix run .#status          # Show cluster status
-nix run .#kubeconfig      # Print kubeconfig
-nix run .#reset           # Reset cluster (dangerous!)
-
-# Development
-nix run .#validate        # Validate configuration
-nix run .#dry-run         # Show what would be done
+# Force-add to git (bypasses .gitignore)
+git add --force secrets/prod.nix
 ```
 
-### 10.2 Flake Apps
+### 10.4 Directory Structure
+
+```
+secrets/
+├── .gitignore      # Blocks ALL files by default (security)
+├── .sops.yaml      # SOPS configuration (age/GPG keys)
+├── README.md       # Instructions
+├── prod.nix        # Encrypted (git add --force)
+└── dev.nix         # Encrypted (git add --force)
+```
+
+### 10.5 .gitignore (Security)
+
+```gitignore
+# SECURITY: Ignore ALL by default — only encrypted files allowed
+*
+!.gitignore
+!.sops.yaml
+!README.md
+
+# Encrypted files must be force-added:
+#   git add --force secrets/prod.nix
+```
+
+### 10.6 Cluster Configuration
 
 ```nix
-# flake.nix apps section
-apps.x86_64-linux = {
-  default = self.apps.x86_64-linux.bootstrap;
-  
-  bootstrap = {
-    type = "app";
-    program = "${bootstrapScript}/bin/bootstrap-cluster";
-  };
-  
-  status = {
-    type = "app";
-    program = "${statusScript}/bin/cluster-status";
-  };
-  
-  kubeconfig = {
-    type = "app";
-    program = "${kubeconfigScript}/bin/get-kubeconfig";
-  };
-  
-  validate = {
-    type = "app";
-    program = "${validateScript}/bin/validate-config";
+clusters.prod = {
+  secrets = import ./secrets/prod.nix;
+
+  members = {
+    server1 = { node = "server-nvme"; role = "server"; ip = "192.168.1.10"; };
+    agent1 = { node = "agent-gpu"; role = "agent"; ip = "192.168.1.20"; };
   };
 };
+```
+
+### 10.7 k3s Token Model
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      k3s Token Usage                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Server (first):                                                │
+│    k3s server --token=<token> --cluster-init                    │
+│                                                                  │
+│  Server (join):                                                  │
+│    k3s server --token=<token> --server=https://first:6443       │
+│                                                                  │
+│  Agent:                                                          │
+│    k3s agent --token=<agentToken> --server=https://server:6443  │
+│                                                                  │
+│  Single token for cluster membership — no expiration.           │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 11. Security Considerations
+## 11. YAML Export
 
-### 11.1 Secrets Management
-
-```nix
-# Option 1: sops-nix for SSH keys and sensitive data
-sops = {
-  defaultSopsFile = ./secrets/cluster.yaml;
-  secrets = {
-    "nodes/cp1/ssh_key" = {};
-    "kubernetes/encryption_key" = {};
-  };
-};
-
-# Option 2: agenix
-age.secrets = {
-  ssh-deploy-key.file = ./secrets/deploy-key.age;
-};
-
-# Option 3: Environment variables (CI/CD)
-# SSH keys passed via environment, not stored in repo
+```bash
+nix build .#config-yaml
+cat result/config.yaml
 ```
-
-### 11.2 Network Security
-
-- API server bound to specific IPs
-- etcd peer authentication with client certs
-- Firewall rules per node role
-- Optional: WireGuard mesh between nodes
-
-### 11.3 Certificate Management
-
-```nix
-# modules/kubernetes/certificates.nix
-{
-  # kubeadm handles PKI by default
-  # For custom PKI:
-  kubernetes.pki = {
-    external = false;  # Use kubeadm-generated certs
-    
-    # Or bring your own:
-    # caCert = ./pki/ca.crt;
-    # caKey = sops.secrets.ca-key.path;
-  };
-}
-```
-
----
-
-## 12. Testing Strategy
-
-### 12.1 Local Testing with VMs
-
-```nix
-# tests/vm-cluster.nix
-{
-  # NixOS test with QEMU VMs
-  nodes = {
-    cp = { ... }: {
-      imports = [ ../modules/node/control-plane.nix ];
-      virtualisation.memorySize = 4096;
-      virtualisation.cores = 2;
-    };
-    
-    worker = { ... }: {
-      imports = [ ../modules/node/worker.nix ];
-      virtualisation.memorySize = 2048;
-    };
-  };
-  
-  testScript = ''
-    start_all()
-    cp.wait_for_unit("kubelet.service")
-    worker.wait_for_unit("kubelet.service")
-    cp.succeed("kubectl get nodes | grep -q worker")
-  '';
-}
-```
-
-### 12.2 CI Pipeline
 
 ```yaml
-# .github/workflows/test.yml
-jobs:
-  validate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: cachix/install-nix-action@v22
-      - run: nix run .#validate
-  
-  vm-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: cachix/install-nix-action@v22
-      - run: nix build .#checks.x86_64-linux.vm-cluster
-```
+nodes:
+  standard:
+    network:
+      mac: "aa:bb:cc:dd:ee:01"
+    install:
+      disk: /dev/sda
 
----
+clusters:
+  dev:
+    k3s:
+      version: "v1.31.0+k3s1"
+    # secrets imported from encrypted file, not shown in export
+    members:
+      server:
+        node: standard
+        role: server
+        ip: 192.168.1.10
+      agent:
+        node: standard
+        role: agent
+        ip: 192.168.1.20
 
-## 13. Future Enhancements
-
-### 13.1 Roadmap
-
-| Priority | Feature | Description |
-|----------|---------|-------------|
-| P0 | Basic flow | 1 CP + 1 worker with nixos-anywhere |
-| P0 | HA support | 3 CP with kube-vip |
-| P1 | PXE boot | Full PXE server module |
-| P1 | DRBD extension | Storage class integration |
-| P2 | Monitoring | Prometheus + Grafana bundle |
-| P2 | Backup | etcd backup automation |
-| P3 | Multi-cluster | Fleet management |
-
-### 13.2 Integration Possibilities
-
-- **Crossplane** — manage external resources
-- **ArgoCD** — GitOps for workloads
-- **Vault** — secrets management
-- **Cilium** — advanced networking (via Cozystack)
-
----
-
-## 14. References
-
-- [Cozystack Documentation](https://cozystack.io/docs/)
-- [kubeadm Reference](https://kubernetes.io/docs/reference/setup-tools/kubeadm/)
-- [NixOS Kubernetes Module](https://nixos.wiki/wiki/Kubernetes)
-- [nixos-anywhere](https://github.com/nix-community/nixos-anywhere)
-- [disko](https://github.com/nix-community/disko)
-- [drv-parts](https://github.com/DavHau/drv-parts)
-
----
-
-## Appendix A: Quick Start
-
-```bash
-# 1. Clone template
-git clone https://github.com/you/cozystack-bootstrap-template cluster
-cd cluster
-
-# 2. Edit configuration
-$EDITOR flake.nix  # Set your nodes, IPs, SSH keys
-
-# 3. Validate
-nix run .#validate
-
-# 4. Bootstrap
-nix run .#bootstrap
-
-# 5. Use cluster
-export KUBECONFIG=~/.local/state/cozystack-bootstrap/my-cluster/kubeconfig
-kubectl get nodes
-```
-
----
-
-## Appendix B: Troubleshooting
-
-### Node won't join cluster
-
-```bash
-# Check kubelet logs
-journalctl -u kubelet -f
-
-# Check certificates
-kubeadm certs check-expiration
-
-# Regenerate join token
-kubeadm token create --print-join-command
-```
-
-### Cozystack installation fails
-
-```bash
-# Check Cozystack pods
-kubectl get pods -n cozystack-system
-
-# Check events
-kubectl get events -n cozystack-system --sort-by='.lastTimestamp'
-
-# Check CNI
-kubectl get pods -n kube-system | grep -E 'cilium|calico'
-```
-
-### Reset and retry
-
-```bash
-# On each node
-kubeadm reset -f
-rm -rf /etc/kubernetes /var/lib/etcd /var/lib/kubelet
-
-# Clear state
-rm -rf ~/.local/state/cozystack-bootstrap/my-cluster
-
-# Retry
-nix run .#bootstrap
+provisioning:
+  nixos-anywhere:
+    ssh:
+      user: root
+      keyFile: /home/user/.ssh/id_ed25519
 ```

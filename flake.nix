@@ -1,57 +1,38 @@
 {
-  description = "Cozystack Bootstrap - NixOS cluster provisioning";
+  description = "nix8s - Declarative NixOS-based Kubernetes cluster provisioning";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    disko = {
-      url = "github:nix-community/disko";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    flake-parts.url = "github:hercules-ci/flake-parts";
+    disko.url = "github:nix-community/disko";
+    import-tree.url = "github:vic/import-tree";
+
+    flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
+    disko.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, disko }:
-    let
-      supportedSystems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" "x86_64-darwin" ];
-      forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
+  outputs = inputs@{ flake-parts, import-tree, ... }:
+    flake-parts.lib.mkFlake { inherit inputs; } {
+      imports = [ (import-tree ./flake-parts) ];
 
-      pkgsFor = system: import nixpkgs {
-        inherit system;
-        overlays = [ self.overlays.default ];
-      };
-    in
-    {
-      overlays.default = final: prev: {
-        # Add our packages here
-      };
+      # Example configuration
+      nix8s = {
+        nodes.lima-node.install.disk = "/dev/vda";
 
-      # Library functions for cluster configuration
-      lib = import ./lib { lib = nixpkgs.lib; };
-
-      # Packages
-      packages = forAllSystems (system:
-        let
-          pkgs = pkgsFor system;
-        in {
-          # Example: Lima test cluster
-          lima-cluster = import ./examples/lima-cluster.nix { inherit pkgs nixpkgs self; };
-        }
-      );
-
-      # Development shell
-      devShells = forAllSystems (system:
-        let pkgs = pkgsFor system;
-        in {
-          default = pkgs.mkShell {
-            packages = with pkgs; [
-              lima
-              kubectl
-              kubernetes-helm
-              jq
-              yq-go
-            ];
+        clusters.dev = {
+          k3s.version = "v1.31.0+k3s1";
+          ha.enable = false;
+          secrets = {
+            token = "example-token-replace-me";
+            agentToken = "example-agent-token-replace-me";
           };
-        }
-      );
+          members = {
+            server = { node = "lima-node"; role = "server"; ip = "192.168.105.10"; };
+            agent = { node = "lima-node"; role = "agent"; ip = "192.168.105.11"; };
+          };
+        };
 
+        provisioning.lima = { cpus = 2; memory = "4GiB"; disk = "30GiB"; };
+      };
     };
 }
