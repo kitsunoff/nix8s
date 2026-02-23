@@ -10,6 +10,7 @@
         ./outputs.nix
         ./pxe.nix
         ./helm.nix
+        ./manifests.nix
         ./devshell.nix
         ./systems.nix
         ./apps/gen-secrets.nix
@@ -21,6 +22,7 @@
     outputs = ./outputs.nix;
     pxe = ./pxe.nix;
     helm = ./helm.nix;
+    manifests = ./manifests.nix;
     devshell = ./devshell.nix;
     systems = ./systems.nix;
     gen-secrets = ./apps/gen-secrets.nix;

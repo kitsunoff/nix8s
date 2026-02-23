@@ -53,6 +53,7 @@ let
         (nix8sModulesPath + "/base.nix")
         (nix8sModulesPath + "/k3s.nix")
         (nix8sModulesPath + "/helm-bootstrap.nix")
+        (nix8sModulesPath + "/manifests-bootstrap.nix")
       ] ++ (nodeConfig.nixosModules or [ ])
       ++ (cfg.nixosModulesFor.${nodeName} or [ ]);
     };
