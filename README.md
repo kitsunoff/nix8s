@@ -12,8 +12,8 @@ nix flake init --template github:kitsunoff/nix8s
 nix run .#gen-secrets -- dev
 
 # Encrypt with sops
-sops --encrypt --in-place nix8s/secrets/dev.nix
-git add --force nix8s/secrets/dev.nix
+sops encrypt --in-place nix8s/secrets/dev.json
+git add --force nix8s/secrets/dev.json
 ```
 
 ## Project Structure
@@ -28,7 +28,7 @@ my-cluster/
     │   └── dev.nix
     ├── provisioning.nix     # Provisioning method config
     └── secrets/             # Encrypted secrets (sops)
-        └── dev.nix
+        └── dev.json
 ```
 
 ## Usage
@@ -61,7 +61,7 @@ my-cluster/
       vip = "192.168.1.100";
     };
 
-    secrets = import ../secrets/prod.nix;
+    secrets = builtins.fromJSON (builtins.readFile ../secrets/prod.json);
 
     members = {
       server1 = { node = "server-nvme"; role = "server"; ip = "192.168.1.10"; };
@@ -184,10 +184,10 @@ Secrets are managed with sops encryption:
 nix run .#gen-secrets -- prod
 
 # Encrypt before committing
-sops --encrypt --in-place nix8s/secrets/prod.nix
+sops encrypt --in-place nix8s/secrets/prod.json
 
 # Force-add to git (gitignore blocks unencrypted)
-git add --force nix8s/secrets/prod.nix
+git add --force nix8s/secrets/prod.json
 ```
 
 ## License

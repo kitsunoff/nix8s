@@ -42,7 +42,7 @@ in
           SECRETS_DIR="nix8s/secrets"
           mkdir -p "$SECRETS_DIR"
 
-          SECRETS_FILE="$SECRETS_DIR/$CLUSTER_NAME.nix"
+          SECRETS_FILE="$SECRETS_DIR/$CLUSTER_NAME.json"
 
           if [[ -f "$SECRETS_FILE" ]]; then
             echo "Warning: $SECRETS_FILE already exists!"
@@ -59,24 +59,18 @@ in
           AGENT_TOKEN=$(${genToken})
 
           cat > "$SECRETS_FILE" << EOF
-          # Secrets for cluster: $CLUSTER_NAME
-          # Generated: $(date -Iseconds)
-          #
-          # IMPORTANT: Encrypt this file before committing!
-          #   sops --encrypt --in-place $SECRETS_FILE
-          #   git add --force $SECRETS_FILE
-          {
-            token = "$TOKEN";
-            agentToken = "$AGENT_TOKEN";
-          }
-          EOF
+{
+  "token": "$TOKEN",
+  "agentToken": "$AGENT_TOKEN"
+}
+EOF
 
           echo ""
           echo "Created: $SECRETS_FILE"
           echo ""
           echo "Next steps:"
           echo "  1. Encrypt with sops:"
-          echo "     sops --encrypt --in-place $SECRETS_FILE"
+          echo "     sops encrypt --in-place $SECRETS_FILE"
           echo ""
           echo "  2. Force-add to git:"
           echo "     git add --force $SECRETS_FILE"

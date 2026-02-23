@@ -7,7 +7,7 @@
     ha.enable = false;
 
     # Generate with: nix run .#gen-secrets -- dev
-    secrets = import ../secrets/dev.nix;
+    secrets = builtins.fromJSON (builtins.readFile ../secrets/dev.json);
 
     members = {
       server = {
