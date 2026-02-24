@@ -161,6 +161,7 @@ in
 
     services.multipath = {
       enable = true;
+      pathGroups = [ ];  # Empty config, LINSTOR will manage paths
     };
 
     # Kernel modules
