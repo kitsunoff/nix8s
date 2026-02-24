@@ -93,6 +93,7 @@ in
 
   # Required packages
   environment.systemPackages = with pkgs; [
+    nixos-install-tools
     vim
     htop
     parted
