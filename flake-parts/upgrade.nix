@@ -233,6 +233,7 @@ in
               local node_name=$1
               local node_ip=$2
               echo "Rolling back $node_name..."
+              # shellcheck disable=SC2086
               ssh $SSH_OPTS "$SSH_USER@$node_ip" \
                 "nixos-rebuild switch --rollback" || true
             }
@@ -241,7 +242,7 @@ in
             upgrade_node() {
               local node_name=$1
               local node_ip=$2
-              local member_name=$3
+              local _member_name=$3  # Reserved for future use
 
               echo ""
               echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
