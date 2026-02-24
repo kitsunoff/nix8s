@@ -37,15 +37,15 @@ let
     echo "Primary MAC: $MAC"
 
     # Get IP address
-    IP=$(ip -4 addr show "$PRIMARY_IFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
-    echo "IP Address: $IP"
+    IP_ADDR=$(ip -4 addr show "$PRIMARY_IFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+    echo "IP Address: $IP_ADDR"
 
     # Get all network interfaces
-    INTERFACES=$(ip -j link show | ${pkgs.jq}/bin/jq -c '[.[] | select(.ifname != "lo") | {name: .ifname, mac: .address}]')
+    INTERFACES=$(ip -j link show | jq -c '[.[] | select(.ifname != "lo") | {name: .ifname, mac: .address}]')
 
     # Get disk information
-    DISKS=$(lsblk -J -o NAME,SIZE,TYPE,MODEL,SERIAL | ${pkgs.jq}/bin/jq -c '.blockdevices | [.[] | select(.type == "disk")]')
-    echo "Disks found: $(echo "$DISKS" | ${pkgs.jq}/bin/jq length)"
+    DISKS=$(lsblk -J -o NAME,SIZE,TYPE,MODEL,SERIAL | jq -c '.blockdevices | [.[] | select(.type == "disk")]')
+    echo "Disks found: $(echo "$DISKS" | jq length)"
 
     # Get memory info
     MEMORY_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
@@ -68,9 +68,9 @@ let
     fi
 
     # Build JSON payload
-    PAYLOAD=$(${pkgs.jq}/bin/jq -n \
+    PAYLOAD=$(jq -n \
       --arg mac "$MAC" \
-      --arg ip "$IP" \
+      --arg ip "$IP_ADDR" \
       --arg hostname "$(hostname)" \
       --argjson interfaces "$INTERFACES" \
       --argjson disks "$DISKS" \
@@ -104,7 +104,7 @@ let
 
     echo ""
     echo "Hardware info collected:"
-    echo "$PAYLOAD" | ${pkgs.jq}/bin/jq .
+    echo "$PAYLOAD" | jq .
 
     # Try to report to PXE server
     echo ""
@@ -122,7 +122,7 @@ let
 
     REPORT_URL="http://''${SERVER_IP}:''${SERVER_PORT}/api/discover"
 
-    if ${pkgs.curl}/bin/curl -s -X POST \
+    if curl -s -X POST \
         -H "Content-Type: application/json" \
         -d "$PAYLOAD" \
         "$REPORT_URL" > /tmp/response.json 2>&1; then
@@ -138,20 +138,20 @@ let
     echo "=========================================="
     echo " Discovery complete!"
     echo " MAC: $MAC"
-    echo " IP: $IP"
+    echo " IP: $IP_ADDR"
     echo ""
     echo " Add this node to your cluster config:"
     echo ""
     echo "   members.<name> = {"
     echo "     node = \"<node-template>\";"
     echo "     role = \"server\"; # or \"agent\""
-    echo "     ip = \"$IP\";"
+    echo "     ip = \"$IP_ADDR\";"
     echo "     network.mac = \"$MAC\";"
     echo "   };"
     echo "=========================================="
     echo ""
     echo "System will stay up for SSH access."
-    echo "SSH: ssh root@$IP (empty password)"
+    echo "SSH: ssh root@$IP_ADDR (empty password)"
   '';
 
 in
@@ -161,8 +161,8 @@ in
     "${modulesPath}/installer/netboot/netboot-minimal.nix"
   ];
 
-  # Hostname for discovery
-  networking.hostName = lib.mkForce "${clusterName}-discovery";
+  # Hostname will be set dynamically based on MAC address
+  networking.hostName = lib.mkForce "discovery";
 
   # Enable SSH for access
   services.openssh = {
@@ -176,11 +176,39 @@ in
   # Empty root password
   users.users.root.initialHashedPassword = lib.mkForce "";
 
+  # Set hostname based on MAC address (runs early, before discovery)
+  systemd.services.set-hostname-from-mac = {
+    description = "Set hostname based on MAC address";
+    wantedBy = [ "multi-user.target" ];
+    before = [ "network-online.target" "nix8s-discovery.service" ];
+    after = [ "systemd-udevd.service" ];
+
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+
+    script = ''
+      # Get first non-lo interface MAC
+      PRIMARY_IFACE=$(${pkgs.iproute2}/bin/ip -o link show | ${pkgs.gnugrep}/bin/grep -v "lo:" | ${pkgs.coreutils}/bin/head -1 | ${pkgs.gawk}/bin/awk -F': ' '{print $2}')
+      if [[ -n "$PRIMARY_IFACE" ]] && [[ -f "/sys/class/net/$PRIMARY_IFACE/address" ]]; then
+        MAC=$(${pkgs.coreutils}/bin/cat /sys/class/net/"$PRIMARY_IFACE"/address)
+        # Convert MAC to hostname: aa:bb:cc:dd:ee:ff -> discovery-aabbccddeeff
+        MAC_CLEAN=$(echo "$MAC" | ${pkgs.coreutils}/bin/tr -d ':' | ${pkgs.coreutils}/bin/tr '[:upper:]' '[:lower:]')
+        NEW_HOSTNAME="discovery-$MAC_CLEAN"
+        ${pkgs.hostname}/bin/hostname "$NEW_HOSTNAME"
+        echo "Hostname set to: $NEW_HOSTNAME"
+      else
+        echo "Could not determine MAC address, keeping default hostname"
+      fi
+    '';
+  };
+
   # Run discovery on boot
   systemd.services.nix8s-discovery = {
     description = "nix8s Hardware Discovery";
     wantedBy = [ "multi-user.target" ];
-    after = [ "network-online.target" ];
+    after = [ "network-online.target" "set-hostname-from-mac.service" ];
     wants = [ "network-online.target" ];
 
     serviceConfig = {
@@ -198,6 +226,13 @@ in
     htop
     jq
     curl
+    iproute2
+    gawk
+    gnugrep
+    coreutils
+    findutils
+    hostname
+    util-linux
     pciutils
     usbutils
     dmidecode
