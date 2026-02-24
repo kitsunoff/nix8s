@@ -60,6 +60,53 @@ in
                       joinCIDR: "${joinCIDR}"
           '';
 
+          # LINSTOR storage configuration
+          linstorCfg = cozystackCfg.linstor or { };
+          linstorEnabled = linstorCfg.enable or false;
+          storagePoolName = linstorCfg.storage.poolName or "data";
+          storageType = linstorCfg.storage.type or "lvm";  # lvm or zfs
+
+          # Build node list with partition info
+          memberNodes = lib.mapAttrsToList (memberName: member: {
+            name = "${clusterName}-${memberName}";
+            ip = member.ip;
+          }) cluster.members;
+
+          # StorageClass manifests
+          storageClassesYaml = pkgs.writeText "linstor-storageclasses.yaml" ''
+            ---
+            apiVersion: storage.k8s.io/v1
+            kind: StorageClass
+            metadata:
+              name: local
+              annotations:
+                storageclass.kubernetes.io/is-default-class: "true"
+            provisioner: linstor.csi.linbit.com
+            parameters:
+              linstor.csi.linbit.com/storagePool: "${storagePoolName}"
+              linstor.csi.linbit.com/layerList: "storage"
+              linstor.csi.linbit.com/allowRemoteVolumeAccess: "false"
+            volumeBindingMode: WaitForFirstConsumer
+            allowVolumeExpansion: true
+            ---
+            apiVersion: storage.k8s.io/v1
+            kind: StorageClass
+            metadata:
+              name: replicated
+            provisioner: linstor.csi.linbit.com
+            parameters:
+              linstor.csi.linbit.com/storagePool: "${storagePoolName}"
+              linstor.csi.linbit.com/autoPlace: "3"
+              linstor.csi.linbit.com/layerList: "drbd storage"
+              linstor.csi.linbit.com/allowRemoteVolumeAccess: "true"
+              property.linstor.csi.linbit.com/DrbdOptions/auto-quorum: suspend-io
+              property.linstor.csi.linbit.com/DrbdOptions/Resource/on-no-data-accessible: suspend-io
+              property.linstor.csi.linbit.com/DrbdOptions/Resource/on-suspended-primary-outdated: force-secondary
+              property.linstor.csi.linbit.com/DrbdOptions/Net/rr-conflict: retry-connect
+            volumeBindingMode: Immediate
+            allowVolumeExpansion: true
+          '';
+
         in
         lib.optionalAttrs enabled {
           "${clusterName}-cozystack-bootstrap" = pkgs.writeShellApplication {
@@ -128,6 +175,85 @@ in
               echo ""
               echo "Wait for all nodes to be ready:"
               echo "  kubectl wait --for=condition=Ready nodes --all --timeout=600s"
+              echo ""
+              echo "After LINSTOR is ready, setup storage:"
+              echo "  nix run .#${clusterName}-linstor-setup"
+            '';
+          };
+        } // lib.optionalAttrs linstorEnabled {
+          "${clusterName}-linstor-setup" = pkgs.writeShellApplication {
+            name = "${clusterName}-linstor-setup";
+            runtimeInputs = with pkgs; [ kubectl ];
+            text = ''
+              set -euo pipefail
+
+              echo "========================================"
+              echo " LINSTOR Storage Setup"
+              echo " Cluster: ${clusterName}"
+              echo " Pool: ${storagePoolName}"
+              echo " Type: ${storageType}"
+              echo "========================================"
+              echo ""
+
+              # Create linstor alias
+              linstor() {
+                kubectl exec -n cozy-linstor deploy/linstor-controller -- linstor "$@"
+              }
+
+              # Check LINSTOR controller is ready
+              echo "Checking LINSTOR controller..."
+              if ! kubectl get deploy -n cozy-linstor linstor-controller &>/dev/null; then
+                echo "ERROR: LINSTOR controller not found"
+                echo "Make sure cozystack is fully deployed first"
+                exit 1
+              fi
+
+              kubectl wait --for=condition=Available \
+                --timeout=300s \
+                -n cozy-linstor \
+                deployment/linstor-controller
+              echo "LINSTOR controller is ready"
+              echo ""
+
+              # List available physical storage
+              echo "Available physical storage:"
+              linstor physical-storage list
+              echo ""
+
+              # Create storage pools on each node
+              echo "Creating storage pools..."
+              ${lib.concatMapStringsSep "\n" (node: ''
+                echo "  Creating pool on ${node.name}..."
+                if linstor storage-pool list | grep -q "${node.name}.*${storagePoolName}"; then
+                  echo "    Pool already exists, skipping"
+                else
+                  linstor physical-storage create-device-pool \
+                    ${storageType} ${node.name} \
+                    /dev/disk/by-partlabel/disk-main-linstor \
+                    --pool-name ${storagePoolName} \
+                    --storage-pool ${storagePoolName} || echo "    Failed to create pool (device may not exist)"
+                fi
+              '') memberNodes}
+              echo ""
+
+              # Verify pools
+              echo "Storage pools:"
+              linstor storage-pool list
+              echo ""
+
+              # Apply StorageClasses
+              echo "Applying StorageClasses..."
+              kubectl apply -f ${storageClassesYaml}
+              echo ""
+
+              # Verify
+              echo "StorageClasses:"
+              kubectl get storageclasses
+              echo ""
+
+              echo "========================================"
+              echo " LINSTOR setup complete!"
+              echo "========================================"
             '';
           };
         };
