@@ -182,6 +182,7 @@ in
     wantedBy = [ "multi-user.target" ];
     before = [ "network-online.target" "nix8s-discovery.service" ];
     after = [ "systemd-udevd.service" ];
+    path = with pkgs; [ iproute2 gnugrep coreutils gawk hostname ];
 
     serviceConfig = {
       Type = "oneshot";
@@ -190,13 +191,13 @@ in
 
     script = ''
       # Get first non-lo interface MAC
-      PRIMARY_IFACE=$(${pkgs.iproute2}/bin/ip -o link show | ${pkgs.gnugrep}/bin/grep -v "lo:" | ${pkgs.coreutils}/bin/head -1 | ${pkgs.gawk}/bin/awk -F': ' '{print $2}')
+      PRIMARY_IFACE=$(ip -o link show | grep -v "lo:" | head -1 | awk -F': ' '{print $2}')
       if [[ -n "$PRIMARY_IFACE" ]] && [[ -f "/sys/class/net/$PRIMARY_IFACE/address" ]]; then
-        MAC=$(${pkgs.coreutils}/bin/cat /sys/class/net/"$PRIMARY_IFACE"/address)
+        MAC=$(cat /sys/class/net/"$PRIMARY_IFACE"/address)
         # Convert MAC to hostname: aa:bb:cc:dd:ee:ff -> discovery-aabbccddeeff
-        MAC_CLEAN=$(echo "$MAC" | ${pkgs.coreutils}/bin/tr -d ':' | ${pkgs.coreutils}/bin/tr '[:upper:]' '[:lower:]')
+        MAC_CLEAN=$(echo "$MAC" | tr -d ':' | tr '[:upper:]' '[:lower:]')
         NEW_HOSTNAME="discovery-$MAC_CLEAN"
-        ${pkgs.hostname}/bin/hostname "$NEW_HOSTNAME"
+        hostname "$NEW_HOSTNAME"
         echo "Hostname set to: $NEW_HOSTNAME"
       else
         echo "Could not determine MAC address, keeping default hostname"
@@ -210,6 +211,7 @@ in
     wantedBy = [ "multi-user.target" ];
     after = [ "network-online.target" "set-hostname-from-mac.service" ];
     wants = [ "network-online.target" ];
+    path = with pkgs; [ iproute2 gnugrep coreutils gawk findutils hostname util-linux jq curl ];
 
     serviceConfig = {
       Type = "oneshot";
