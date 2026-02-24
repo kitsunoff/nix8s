@@ -364,7 +364,10 @@ in
               echo ""
               echo "Stopping servers..."
               kill $HTTP_PID 2>/dev/null || true
-              kill $DNSMASQ_PID 2>/dev/null || true
+              # dnsmasq may run as root via sudo
+              if [[ -n "''${DNSMASQ_PID:-}" ]]; then
+                kill $DNSMASQ_PID 2>/dev/null || sudo kill $DNSMASQ_PID 2>/dev/null || true
+              fi
               echo "Cleaning up $TFTP_ROOT..."
               rm -rf "$TFTP_ROOT"
             }
@@ -372,31 +375,22 @@ in
 
             sleep 1
 
-            # Check if DHCP/TFTP ports are available
-            echo "Checking ports..."
-            if lsof -i UDP:67 -P -n 2>/dev/null | grep -q LISTEN; then
-              echo "ERROR: UDP port 67 (DHCP) is already in use:"
-              lsof -i UDP:67 -P -n 2>/dev/null
-              echo ""
-              echo "Kill the process or stop the service before running PXE server."
-              exit 1
-            fi
-            if lsof -i UDP:69 -P -n 2>/dev/null | grep -q LISTEN; then
-              echo "ERROR: UDP port 69 (TFTP) is already in use:"
-              lsof -i UDP:69 -P -n 2>/dev/null
-              echo ""
-              echo "Kill the process or stop the service before running PXE server."
-              exit 1
-            fi
-
             echo "Starting dnsmasq (TFTP + ProxyDHCP)..."
             echo ""
+
+            # DHCP requires root privileges (port 67)
+            if [[ $EUID -ne 0 ]]; then
+              echo "Note: DHCP requires root. Using sudo for dnsmasq..."
+              SUDO="sudo"
+            else
+              SUDO=""
+            fi
 
             # Run dnsmasq in foreground
             # Architecture detection via DHCP option 93 (client system architecture)
             # See RFC 4578 for architecture type values:
             #   0 = x86 BIOS, 6 = x86 UEFI (32-bit), 7 = x86_64 UEFI, 9 = EBC, 10 = ARM 64-bit UEFI
-            dnsmasq \
+            $SUDO dnsmasq \
               --no-daemon \
               --port=0 \
               --interface="$INTERFACE" \
