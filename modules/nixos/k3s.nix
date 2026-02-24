@@ -6,27 +6,26 @@ let
   member = nix8s.member;
   isFirstServer = nix8s.isFirstServer;
 
-  # Get cluster network settings
+  # Get cluster settings
   k3sConfig = cluster.k3s or { };
-  haConfig = cluster.ha or { };
   secrets = cluster.secrets;
-  cozystackCfg = cluster.cozystack or {};
+  cozystackCfg = cluster.cozystack or { };
   cozystackEnabled = cozystackCfg.enable or false;
 
-  # Server URL for joining
-  # If HA with VIP, use VIP; otherwise use first server's IP
-  serverUrl =
-    if haConfig.vip or null != null
-    then "https://${haConfig.vip}:6443"
-    else
-      let
-        # Find first server IP
-        firstServerName = haConfig.firstServer or
-          (lib.head (lib.sort (a: b: a < b)
-            (lib.attrNames (lib.filterAttrs (_: m: m.role == "server") cluster.members))));
-        firstServer = cluster.members.${firstServerName};
-      in
-      "https://${firstServer.ip}:6443";
+  # k3s package (can be overridden via cluster.k3s.package)
+  k3sPackage = k3sConfig.package or pkgs.k3s;
+
+  # Server URL for joining (first server's IP)
+  # After initial join, k3s agent uses built-in loadbalancer on 127.0.0.1:6444
+  # which automatically discovers all servers - no VIP needed
+  serverMembers = lib.filterAttrs (_: m: m.role == "server") cluster.members;
+  sortedServerNames = lib.sort (a: b: a < b) (lib.attrNames serverMembers);
+  firstServerName =
+    if cluster.firstServer or null != null
+    then cluster.firstServer
+    else lib.head sortedServerNames;
+  firstServer = cluster.members.${firstServerName};
+  serverUrl = "https://${firstServer.ip}:6443";
 
   # Build extra flags
   extraServerFlags = k3sConfig.extraArgs.server or [ ];
@@ -77,7 +76,7 @@ in
 {
   services.k3s = {
     enable = true;
-    package = pkgs.k3s;
+    package = k3sPackage;
 
     role = member.role;
 

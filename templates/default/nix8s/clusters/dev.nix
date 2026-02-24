@@ -3,8 +3,8 @@
 
 {
   nix8s.clusters.dev = {
-    k3s.version = "v1.31.0+k3s1";
-    ha.enable = false;
+    # Optional: override k3s package
+    # k3s.package = pkgs.k3s_1_30;
 
     # Generate with: nix run .#gen-secrets -- dev
     secrets = builtins.fromJSON (builtins.readFile ../secrets/dev.json);

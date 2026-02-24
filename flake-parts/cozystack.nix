@@ -16,11 +16,11 @@ in
           enabled = cozystackCfg.enable or false;
 
           # Get first server IP for API endpoint
-          firstServerName = cluster.ha.firstServer or
+          firstServerName = cluster.firstServer or
             (lib.head (lib.sort (a: b: a < b)
               (lib.attrNames (lib.filterAttrs (_: m: m.role == "server") cluster.members))));
           firstServer = cluster.members.${firstServerName};
-          apiServerIp = cluster.ha.vip or firstServer.ip;
+          apiServerIp = firstServer.ip;
 
           # Cozystack configuration
           host = cozystackCfg.host or "cozystack.local";

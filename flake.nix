@@ -20,8 +20,6 @@
         nodes.lima-node.install.disk = "/dev/vda";
 
         clusters.dev = {
-          k3s.version = "v1.31.0+k3s1";
-          ha.enable = false;
           secrets = {
             token = "example-token-replace-me";
             agentToken = "example-agent-token-replace-me";

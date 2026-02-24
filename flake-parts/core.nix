@@ -72,10 +72,10 @@ let
       description = "k3s configuration (version, network, extraArgs)";
     };
 
-    ha = lib.mkOption {
-      type = lib.types.attrsOf lib.types.anything;
-      default = { enable = false; };
-      description = "HA configuration (enable, firstServer, vip)";
+    firstServer = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Name of first server for cluster-init (auto-detected if not set)";
     };
 
     secrets = lib.mkOption {
