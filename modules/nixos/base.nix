@@ -8,6 +8,11 @@ let
   clusterName = nix8s.clusterName;
   memberName = nix8s.memberName;
 
+  # Installer/discovery modes don't mount disks
+  isInstaller = nix8s.isInstaller or false;
+  isDiscovery = nix8s.isDiscovery or false;
+  isNetboot = isInstaller || isDiscovery;
+
   # SSH public key from cluster secrets (for node access)
   sshPubKey = cluster.secrets.sshPubKey or null;
 
@@ -65,14 +70,14 @@ let
 
 in
 {
-  # Disko configuration
-  disko.devices = diskoConfig.devices or { };
+  # Disko configuration (skip for netboot images - they don't mount disks)
+  disko.devices = lib.mkIf (!isNetboot) (diskoConfig.devices or { });
 
   # Hostname
   networking.hostName = "${clusterName}-${memberName}";
 
-  # Boot loader (EFI)
-  boot.loader = {
+  # Boot loader (EFI) - skip for netboot images
+  boot.loader = lib.mkIf (!isNetboot) {
     systemd-boot.enable = true;
     efi.canTouchEfiVariables = true;
   };
