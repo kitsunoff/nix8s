@@ -173,15 +173,29 @@ in
       "drbd"
     ];
 
-    # Firewall rules for LINSTOR/DRBD
-    networking.firewall = lib.mkIf linstorEnabled {
+    # Firewall rules for Cozystack components
+    networking.firewall = {
+      # Kube-OVN / OVN ports (required for all nodes)
       allowedTCPPorts = [
+        6641  # OVN Northbound DB
+        6642  # OVN Southbound DB
+        6643  # OVN NB Raft
+        6644  # OVN SB Raft
+        10660 # kube-ovn-controller metrics
+        10661 # kube-ovn-monitor
+        10665 # kube-ovn-cni
+      ] ++ lib.optionals linstorEnabled [
         3366  # LINSTOR controller
         3370  # LINSTOR satellite SSL
         3376  # LINSTOR controller SSL
         3377  # LINSTOR satellite
       ];
-      allowedTCPPortRanges = [
+      allowedUDPPorts = [
+        6081  # Geneve encapsulation (OVN overlay)
+        4789  # VXLAN (Cilium)
+        8472  # Flannel VXLAN (if used)
+      ];
+      allowedTCPPortRanges = lib.optionals linstorEnabled [
         { from = 7000; to = 8000; }  # DRBD replication
       ];
     };
