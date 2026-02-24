@@ -354,6 +354,100 @@ nix run .#prod-pxe-server
 nix build .#prod-pxe-assets
 ```
 
+## Cozystack Integration
+
+Deploy [Cozystack](https://cozystack.io) platform on your cluster:
+
+```nix
+nix8s.clusters.prod = {
+  cozystack = {
+    enable = true;
+    host = "cozy.example.com";
+
+    # LINSTOR distributed storage
+    linstor = {
+      enable = true;
+      partition.size = "100%";  # Use remaining disk space
+      storage.poolName = "data";
+      storage.type = "lvm";     # or "zfs"
+    };
+
+    # MetalLB load balancer
+    metallb = {
+      enable = true;
+      addresses = [ "192.168.1.200-192.168.1.250" ];
+      mode = "l2";  # or "bgp"
+    };
+  };
+  # ...
+};
+```
+
+### LINSTOR Storage Options
+
+**Option 1: Partition on system disk (single disk nodes)**
+
+```nix
+# Node config
+nix8s.nodes.my-node = {
+  install.disk = "/dev/nvme0n1";
+  install.rootSize = "100G";  # Fixed root size, rest for LINSTOR
+};
+
+# Cluster config
+cozystack.linstor = {
+  enable = true;
+  partition.size = "100%";  # Use remaining space after root
+};
+```
+
+**Option 2: Dedicated storage disk**
+
+```nix
+nix8s.nodes.my-node = {
+  install.disk = "/dev/nvme0n1";  # System disk
+  linstor.disk = "/dev/sdb";       # Entire disk for LINSTOR
+};
+```
+
+**Option 3: Multiple storage disks**
+
+```nix
+nix8s.nodes.my-node = {
+  install.disk = "/dev/nvme0n1";
+  linstor.disks = [ "/dev/sdb" "/dev/sdc" "/dev/sdd" ];
+};
+```
+
+### Deployment Workflow
+
+```bash
+# 1. Boot nodes via PXE
+nix run .#prod-pxe-server -- eth0
+
+# 2. Fetch kubeconfig after nodes are installed
+nix run .#fetch-kubeconfig -- prod
+export KUBECONFIG=nix8s/secrets/prod-kubeconfig.yaml
+
+# 3. Cozystack auto-bootstraps on first server, or manually:
+# nix run .#prod-cozystack-bootstrap
+
+# 4. Setup LINSTOR storage pools
+nix run .#prod-linstor-setup
+
+# 5. Setup MetalLB networking
+nix run .#prod-metallb-setup
+
+# 6. Access dashboard
+echo "https://cozy.example.com"
+```
+
+### Cozystack Outputs
+
+- `packages.<cluster>-cozystack-bootstrap` — Manual cozystack installation
+- `packages.<cluster>-linstor-setup` — Configure LINSTOR storage pools
+- `packages.<cluster>-metallb-setup` — Configure MetalLB IP pools
+
 ## License
 
 MIT

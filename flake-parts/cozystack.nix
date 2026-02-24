@@ -65,6 +65,47 @@ in
           linstorEnabled = linstorCfg.enable or false;
           storagePoolName = linstorCfg.storage.poolName or "data";
           storageType = linstorCfg.storage.type or "lvm";  # lvm or zfs
+          linstorPartitionSize = linstorCfg.partition.size or null;
+
+          # Resolve node config for a member
+          resolveNodeConfig = memberName: member:
+            let
+              nodeRef = member.node;
+              baseNode = if builtins.isAttrs nodeRef then nodeRef else cfg.nodes.${nodeRef} or { };
+              memberOverrides = removeAttrs member [ "node" "role" "ip" ];
+            in
+            lib.recursiveUpdate baseNode memberOverrides;
+
+          # Build node list with LINSTOR device info
+          memberNodes = lib.mapAttrsToList (memberName: member:
+            let
+              nodeConfig = resolveNodeConfig memberName member;
+              nodeLinstorCfg = nodeConfig.linstor or { };
+
+              # Node-level disk config
+              linstorDisk = nodeLinstorCfg.disk or null;
+              linstorDisks = nodeLinstorCfg.disks or [ ];
+
+              # Determine devices for this node
+              devices =
+                if linstorDisks != [ ] then
+                  # Multiple dedicated disks: use partlabels
+                  lib.imap0 (i: _: "/dev/disk/by-partlabel/disk-linstor${toString i}-linstor") linstorDisks
+                else if linstorDisk != null then
+                  # Single dedicated disk
+                  [ "/dev/disk/by-partlabel/disk-linstor-linstor" ]
+                else if linstorPartitionSize != null then
+                  # Partition on system disk
+                  [ "/dev/disk/by-partlabel/disk-main-linstor" ]
+                else
+                  [ ];
+            in
+            {
+              name = "${clusterName}-${memberName}";
+              ip = member.ip;
+              inherit devices;
+            }
+          ) cluster.members;
 
           # MetalLB configuration
           metallbCfg = cozystackCfg.metallb or { };
@@ -72,12 +113,6 @@ in
           metallbAddresses = metallbCfg.addresses or [ ];  # e.g. ["192.168.100.200-192.168.100.250"]
           metallbMode = metallbCfg.mode or "l2";  # l2 or bgp
           metallbPoolName = metallbCfg.poolName or "cozystack";
-
-          # Build node list with partition info
-          memberNodes = lib.mapAttrsToList (memberName: member: {
-            name = "${clusterName}-${memberName}";
-            ip = member.ip;
-          }) cluster.members;
 
           # MetalLB manifests
           metallbPoolYaml = pkgs.writeText "metallb-pool.yaml" ''
@@ -254,18 +289,25 @@ in
 
               # Create storage pools on each node
               echo "Creating storage pools..."
-              ${lib.concatMapStringsSep "\n" (node: ''
-                echo "  Creating pool on ${node.name}..."
-                if linstor storage-pool list | grep -q "${node.name}.*${storagePoolName}"; then
-                  echo "    Pool already exists, skipping"
-                else
-                  linstor physical-storage create-device-pool \
-                    ${storageType} ${node.name} \
-                    /dev/disk/by-partlabel/disk-main-linstor \
-                    --pool-name ${storagePoolName} \
-                    --storage-pool ${storagePoolName} || echo "    Failed to create pool (device may not exist)"
-                fi
-              '') memberNodes}
+              ${lib.concatMapStringsSep "\n" (node:
+                if node.devices == [ ] then ''
+                  echo "  ${node.name}: no LINSTOR devices configured, skipping"
+                '' else ''
+                  echo "  ${node.name}:"
+                  ${lib.concatMapStringsSep "\n" (device: ''
+                    echo "    Adding device ${device}..."
+                    if linstor storage-pool list | grep -q "${node.name}.*${storagePoolName}"; then
+                      echo "      Pool already exists, skipping"
+                    else
+                      linstor physical-storage create-device-pool \
+                        ${storageType} ${node.name} \
+                        ${device} \
+                        --pool-name ${storagePoolName} \
+                        --storage-pool ${storagePoolName} || echo "      Failed to create pool (device may not exist)"
+                    fi
+                  '') node.devices}
+                ''
+              ) memberNodes}
               echo ""
 
               # Verify pools

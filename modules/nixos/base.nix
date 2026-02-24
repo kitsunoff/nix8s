@@ -16,19 +16,51 @@ let
   # SSH public key from cluster secrets (for node access)
   sshPubKey = cluster.secrets.sshPubKey or null;
 
-  # Cozystack/LINSTOR config
+  # Cozystack/LINSTOR config (cluster-level enables, node-level configures disks)
   cozystackCfg = cluster.cozystack or { };
-  linstorCfg = cozystackCfg.linstor or { };
-  linstorEnabled = linstorCfg.enable or false;
-  linstorPartitionSize = linstorCfg.partition.size or null;
-  linstorDisk = linstorCfg.disk or null;
+  linstorClusterCfg = cozystackCfg.linstor or { };
+  linstorEnabled = linstorClusterCfg.enable or false;
+
+  # Node-level LINSTOR disk config (overrides cluster defaults)
+  nodeLinstorCfg = nodeConfig.linstor or { };
+  linstorDisk = nodeLinstorCfg.disk or null;        # single dedicated disk
+  linstorDisks = nodeLinstorCfg.disks or [ ];       # multiple dedicated disks
+  linstorPartitionSize = linstorClusterCfg.partition.size or null;  # partition on system disk
+
+  # Determine storage mode:
+  # 1. linstor.disks = [ "/dev/sdb" "/dev/sdc" ] — multiple dedicated disks
+  # 2. linstor.disk = "/dev/sdb" — single dedicated disk
+  # 3. install.rootSize + linstor.partition.size — partition on system disk
+  hasLinstorDisks = linstorDisks != [ ];
+  hasLinstorDisk = linstorDisk != null;
+  hasLinstorPartition = linstorEnabled && linstorPartitionSize != null && !hasLinstorDisk && !hasLinstorDisks;
 
   # Simple install mode: generate disko config from install.disk
   # Supports optional LINSTOR partition when cozystack.linstor.enable = true
   simpleDisko = disk: swapSize:
     let
       hasSwap = swapSize != null;
-      hasLinstorPartition = linstorEnabled && linstorPartitionSize != null && linstorDisk == null;
+
+      # Generate disko config for a single LINSTOR disk
+      mkLinstorDisk = name: device: {
+        type = "disk";
+        inherit device;
+        content = {
+          type = "gpt";
+          partitions = {
+            linstor = {
+              size = "100%";
+              # No content — raw partition for LINSTOR/LVM
+            };
+          };
+        };
+      };
+
+      # Multiple disks: linstor0, linstor1, etc.
+      linstorDisksAttrs = lib.listToAttrs (lib.imap0 (i: device:
+        lib.nameValuePair "linstor${toString i}" (mkLinstorDisk "linstor${toString i}" device)
+      ) linstorDisks);
+
     in
     {
       devices.disk.main = {
@@ -73,21 +105,14 @@ let
           };
         };
       };
-    } // lib.optionalAttrs (linstorEnabled && linstorDisk != null) {
-      # Separate disk for LINSTOR
-      devices.disk.linstor = {
-        type = "disk";
-        device = linstorDisk;
-        content = {
-          type = "gpt";
-          partitions = {
-            linstor = {
-              size = "100%";
-              # No content — raw partition for LINSTOR/LVM
-            };
-          };
-        };
-      };
+    }
+    # Single dedicated LINSTOR disk
+    // lib.optionalAttrs hasLinstorDisk {
+      devices.disk.linstor = mkLinstorDisk "linstor" linstorDisk;
+    }
+    # Multiple dedicated LINSTOR disks
+    // lib.optionalAttrs hasLinstorDisks {
+      devices.disk = linstorDisksAttrs;
     };
 
   # Determine disko config: either from install.disk (simple) or disko (custom)
