@@ -127,12 +127,13 @@ in
             members;
 
           # Build netboot files for each installer
+          # Use netbootRamdisk which includes squashfs store inside initrd
           netbootFiles = lib.listToAttrs (map
             (name:
               let
                 installerConfig = config.flake.nixosConfigurations.${name};
                 kernel = "${installerConfig.config.system.build.kernel}/bzImage";
-                initrd = "${installerConfig.config.system.build.initialRamdisk}/initrd";
+                initrd = "${installerConfig.config.system.build.netbootRamdisk}/initrd";
                 toplevel = installerConfig.config.system.build.toplevel;
               in
               lib.nameValuePair name { inherit kernel initrd toplevel; }
@@ -140,10 +141,10 @@ in
             installerNames
           );
 
-          # Discovery image
+          # Discovery image (also use netbootRamdisk)
           discoveryConfig = config.flake.nixosConfigurations."${clusterName}-discovery";
           discoveryKernel = "${discoveryConfig.config.system.build.kernel}/bzImage";
-          discoveryInitrd = "${discoveryConfig.config.system.build.initialRamdisk}/initrd";
+          discoveryInitrd = "${discoveryConfig.config.system.build.netbootRamdisk}/initrd";
           discoveryToplevel = discoveryConfig.config.system.build.toplevel;
 
           # Build MAC to member mapping
