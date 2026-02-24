@@ -4,8 +4,12 @@
 let
   nodeConfig = nix8s.nodeConfig;
   member = nix8s.member;
+  cluster = nix8s.cluster;
   clusterName = nix8s.clusterName;
   memberName = nix8s.memberName;
+
+  # SSH public key from cluster secrets (for node access)
+  sshPubKey = cluster.secrets.sshPubKey or null;
 
   # Simple install mode: generate disko config from install.disk
   simpleDisko = disk: swapSize:
@@ -101,6 +105,10 @@ in
       PasswordAuthentication = false;
     };
   };
+
+  # SSH authorized keys from cluster secrets
+  users.users.root.openssh.authorizedKeys.keys =
+    lib.optional (sshPubKey != null) sshPubKey;
 
   # Basic packages
   environment.systemPackages = with pkgs; [

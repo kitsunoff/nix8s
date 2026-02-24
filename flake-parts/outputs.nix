@@ -12,7 +12,7 @@ let
     then nodeRef
     else
       cfg.nodes.${nodeRef} or
-        (throw "nix8s: clusters.${clusterName}.members.${memberName}.node references '${nodeRef}' which doesn't exist in nix8s.nodes");
+        (throw "nix8s: clusters.${clusterName}.members.${memberName}.node references '${nodeRef}' which doesn't exist in nix8s.nodes. Available nodes: ${builtins.toString (builtins.attrNames cfg.nodes)}");
 
   buildNodeConfig = clusterName: memberName: member:
     let

@@ -1,4 +1,4 @@
-# Generates cluster secrets (k3s tokens)
+# Generates cluster secrets (k3s tokens + SSH keypair)
 { lib, config, ... }:
 
 let
@@ -13,7 +13,7 @@ in
 
       genSecretsScript = pkgs.writeShellApplication {
         name = "gen-secrets";
-        runtimeInputs = with pkgs; [ coreutils ];
+        runtimeInputs = with pkgs; [ coreutils openssh jq ];
         text = ''
           set -euo pipefail
 
@@ -43,6 +43,8 @@ in
           mkdir -p "$SECRETS_DIR"
 
           SECRETS_FILE="$SECRETS_DIR/$CLUSTER_NAME.json"
+          SSH_KEY_FILE="$SECRETS_DIR/''${CLUSTER_NAME}_ssh"
+          SSH_PUB_FILE="$SECRETS_DIR/''${CLUSTER_NAME}_ssh.pub"
 
           if [[ -f "$SECRETS_FILE" ]]; then
             echo "Warning: $SECRETS_FILE already exists!"
@@ -55,25 +57,39 @@ in
 
           echo "Generating secrets for cluster '$CLUSTER_NAME'..."
 
+          # Generate k3s tokens
           TOKEN=$(${genToken})
           AGENT_TOKEN=$(${genToken})
 
-          cat > "$SECRETS_FILE" << EOF
-{
-  "token": "$TOKEN",
-  "agentToken": "$AGENT_TOKEN"
-}
-EOF
+          # Generate SSH keypair
+          echo "Generating SSH keypair..."
+          rm -f "$SSH_KEY_FILE" "$SSH_PUB_FILE"
+          ssh-keygen -t ed25519 -f "$SSH_KEY_FILE" -N "" -C "nix8s-$CLUSTER_NAME"
+          SSH_PUB_KEY=$(cat "$SSH_PUB_FILE")
+
+          # Create secrets JSON with SSH public key
+          jq -n \
+            --arg token "$TOKEN" \
+            --arg agentToken "$AGENT_TOKEN" \
+            --arg sshPubKey "$SSH_PUB_KEY" \
+            '{token: $token, agentToken: $agentToken, sshPubKey: $sshPubKey}' \
+            > "$SECRETS_FILE"
 
           echo ""
-          echo "Created: $SECRETS_FILE"
+          echo "Created:"
+          echo "  $SECRETS_FILE      - k3s tokens + SSH public key"
+          echo "  $SSH_KEY_FILE      - SSH private key (DO NOT COMMIT)"
+          echo "  $SSH_PUB_FILE      - SSH public key"
           echo ""
           echo "Next steps:"
-          echo "  1. Encrypt with sops:"
-          echo "     sops encrypt --in-place $SECRETS_FILE"
+          echo "  1. Add public key and secrets to git:"
+          echo "     git add $SSH_PUB_FILE $SECRETS_FILE"
           echo ""
-          echo "  2. Force-add to git:"
-          echo "     git add --force $SECRETS_FILE"
+          echo "  2. Keep private key safe:"
+          echo "     chmod 600 $SSH_KEY_FILE"
+          echo ""
+          echo "  3. Connect to nodes:"
+          echo "     ssh -i $SSH_KEY_FILE root@<node-ip>"
         '';
       };
 
@@ -87,16 +103,21 @@ EOF
           mkdir -p "$SECRETS_DIR"
 
           cat > "$SECRETS_DIR/.gitignore" << 'EOF'
-          # SECURITY: Ignore ALL by default — only encrypted files allowed
-          *
-          !.gitignore
-          !.sops.yaml
+# SSH private keys - NEVER commit
+*_ssh
 
-          # Encrypted files must be force-added:
-          #   git add --force nix8s/secrets/<cluster>.nix
-          EOF
+# Allow everything else
+!.gitignore
+!*.json
+!*.pub
+EOF
 
           echo "Initialized: $SECRETS_DIR/.gitignore"
+          echo ""
+          echo "This .gitignore:"
+          echo "  - Ignores SSH private keys (*_ssh)"
+          echo "  - Allows .json secrets files"
+          echo "  - Allows .pub public keys"
         '';
       };
     in

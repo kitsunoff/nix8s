@@ -169,7 +169,7 @@ in
                 mac = getMemberMac clusterName memberName member;
               in
               lib.optionalString (mac != null)
-                "iseq ''${net0/mac} ${lib.toLower mac} && goto install-${memberName} ||"
+                "iseq \${net0/mac} ${lib.toLower mac} && goto install-${memberName} ||"
             ) (lib.attrNames members)}
 
             # No MAC match - show menu
