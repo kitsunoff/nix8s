@@ -371,6 +371,24 @@ in
             trap cleanup EXIT INT TERM
 
             sleep 1
+
+            # Check if DHCP/TFTP ports are available
+            echo "Checking ports..."
+            if lsof -i UDP:67 -P -n 2>/dev/null | grep -q LISTEN; then
+              echo "ERROR: UDP port 67 (DHCP) is already in use:"
+              lsof -i UDP:67 -P -n 2>/dev/null
+              echo ""
+              echo "Kill the process or stop the service before running PXE server."
+              exit 1
+            fi
+            if lsof -i UDP:69 -P -n 2>/dev/null | grep -q LISTEN; then
+              echo "ERROR: UDP port 69 (TFTP) is already in use:"
+              lsof -i UDP:69 -P -n 2>/dev/null
+              echo ""
+              echo "Kill the process or stop the service before running PXE server."
+              exit 1
+            fi
+
             echo "Starting dnsmasq (TFTP + ProxyDHCP)..."
             echo ""
 
