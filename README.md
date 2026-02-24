@@ -8,12 +8,21 @@ Declarative NixOS-based Kubernetes (k3s) cluster provisioning with flake-parts.
 # Create new project
 nix flake init --template github:kitsunoff/nix8s
 
-# Generate secrets
+# Initialize secrets directory
+nix run .#init-secrets
+
+# Generate cluster secrets (k3s tokens + SSH keypair)
 nix run .#gen-secrets -- dev
 
-# Encrypt with sops
-sops encrypt --in-place nix8s/secrets/dev.json
-git add --force nix8s/secrets/dev.json
+# Build and deploy via PXE
+nix run .#dev-pxe-server
+
+# After nodes are installed, fetch kubeconfig
+nix run .#fetch-kubeconfig -- dev
+
+# Use kubectl
+export KUBECONFIG=nix8s/secrets/dev-kubeconfig.yaml
+kubectl get nodes
 ```
 
 ## Project Structure
@@ -54,12 +63,11 @@ my-cluster/
 { ... }:
 {
   nix8s.clusters.prod = {
-    k3s.version = "v1.31.0+k3s1";
+    # Optional: override k3s package
+    # k3s.package = pkgs.k3s_1_30;
 
-    ha = {
-      enable = true;
-      vip = "192.168.1.100";
-    };
+    # Optional: specify first server for cluster-init (auto-detected if not set)
+    # firstServer = "server1";
 
     secrets = builtins.fromJSON (builtins.readFile ../secrets/prod.json);
 
@@ -101,8 +109,9 @@ nix flake show
 - `packages.<cluster>-manifests-apply` — Apply raw manifests
 - `packages.<cluster>-pxe-server` — PXE boot server
 - `packages.<cluster>-pxe-assets` — PXE boot assets
-- `apps.gen-secrets` — Generate k3s tokens
-- `apps.init-secrets` — Initialize secrets directory
+- `apps.gen-secrets` — Generate k3s tokens and SSH keypair
+- `apps.init-secrets` — Initialize secrets directory with .gitignore
+- `apps.fetch-kubeconfig` — Fetch kubeconfig from running cluster
 - `devShells.default` — Development shell with kubectl, helm, sops
 
 ## Flake Modules
@@ -119,8 +128,9 @@ Use individual modules for granular control:
     nix8s.flakeModules.manifests   # Raw manifests
     nix8s.flakeModules.upgrade     # Rolling upgrades
     nix8s.flakeModules.devshell    # devShells
-    nix8s.flakeModules.gen-secrets # apps
-    nix8s.flakeModules.systems     # supported systems
+    nix8s.flakeModules.gen-secrets      # gen-secrets, init-secrets apps
+    nix8s.flakeModules.fetch-kubeconfig # fetch-kubeconfig app
+    nix8s.flakeModules.systems          # supported systems
   ];
 }
 ```
@@ -169,6 +179,29 @@ nix8s.nodes.my-node = {
 };
 ```
 
+### Static IP with systemd-networkd
+
+Use MAC address matching for reliable static IP (interface name doesn't matter):
+
+```nix
+nix8s.nodes.my-node = {
+  network.mac = "aa:bb:cc:dd:ee:ff";
+  install.disk = "/dev/nvme0n1";
+
+  nixosModules = [
+    {
+      networking.useNetworkd = true;
+      systemd.network.networks."10-lan" = {
+        matchConfig.MACAddress = "aa:bb:cc:dd:ee:ff";
+        address = [ "192.168.1.10/24" ];
+        gateway = [ "192.168.1.1" ];
+        dns = [ "192.168.1.1" ];
+      };
+    }
+  ];
+};
+```
+
 ## Member Overrides
 
 Override node settings per-member:
@@ -187,16 +220,43 @@ members = {
 
 ## Secrets
 
-Secrets are managed with sops encryption:
+Secrets are generated with SSH keypair for node access:
 
 ```bash
-# Generate secrets for a cluster
+# Initialize secrets directory (creates .gitignore)
+nix run .#init-secrets
+
+# Generate k3s tokens + SSH keypair
 nix run .#gen-secrets -- prod
+```
 
-# Encrypt before committing
+This creates:
+- `nix8s/secrets/prod.json` — k3s tokens + SSH public key (commit this)
+- `nix8s/secrets/prod_ssh` — SSH private key (DO NOT commit, gitignored)
+- `nix8s/secrets/prod_ssh.pub` — SSH public key (commit this)
+
+The SSH public key is automatically added to root's authorized_keys on all nodes.
+
+### Fetch Kubeconfig
+
+After cluster is running:
+
+```bash
+# Fetch kubeconfig via SSH
+nix run .#fetch-kubeconfig -- prod
+
+# Use kubectl
+export KUBECONFIG=nix8s/secrets/prod-kubeconfig.yaml
+kubectl get nodes
+
+# Or merge with existing config
+kubectl kc add --file nix8s/secrets/prod-kubeconfig.yaml --context-name prod
+```
+
+### Optional: Encrypt with SOPS
+
+```bash
 sops encrypt --in-place nix8s/secrets/prod.json
-
-# Force-add to git (gitignore blocks unencrypted)
 git add --force nix8s/secrets/prod.json
 ```
 
