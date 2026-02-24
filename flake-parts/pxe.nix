@@ -412,7 +412,6 @@ in
           pxeConfig = cluster.provisioning.pxe or cfg.provisioning.pxe or { };
           interface = pxeConfig.interface or "eth0";
           httpPort = pxeConfig.httpPort or 8080;
-          tftpRoot = pxeConfig.tftpRoot or "/tmp/nix8s-tftp";
         in
         pkgs.writeShellApplication {
           name = "${clusterName}-pxe-server";
@@ -470,7 +469,7 @@ in
               PROJECT_DIR="$(find_project_root)"
             fi
 
-            TFTP_ROOT="${tftpRoot}"
+            TFTP_ROOT=$(mktemp --directory --tmpdir nix8s-tftp.XXXXXX)
             NODES_DIR="$PROJECT_DIR/nix8s/nodes"
 
             echo "========================================"
@@ -529,8 +528,10 @@ in
               echo "Stopping servers..."
               kill $HTTP_PID 2>/dev/null || true
               kill $DNSMASQ_PID 2>/dev/null || true
+              echo "Cleaning up $TFTP_ROOT..."
+              rm -rf "$TFTP_ROOT"
             }
-            trap cleanup EXIT
+            trap cleanup EXIT INT TERM
 
             sleep 1
             echo "Starting dnsmasq (TFTP + ProxyDHCP)..."
