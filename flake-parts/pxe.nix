@@ -156,8 +156,9 @@ in
               members
           );
 
-          # iPXE menu with MAC-based routing
-          pxeMenu = pkgs.writeText "menu.ipxe" ''
+          # iPXE menu template with placeholders for runtime substitution
+          # __PXE_SERVER__ and __PXE_PORT__ are replaced at runtime
+          pxeMenuTemplate = pkgs.writeText "menu.ipxe.template" ''
             #!ipxe
 
             # MAC-based auto-routing
@@ -192,8 +193,8 @@ in
             # Discovery boot
             :discovery
             echo Booting discovery image...
-            kernel http://''${next-server}:''${http-port}/discovery/bzImage init=${discoveryToplevel}/init initrd=initrd loglevel=4 pxe_server=''${next-server} pxe_port=''${http-port}
-            initrd http://''${next-server}:''${http-port}/discovery/initrd
+            kernel http://__PXE_SERVER__:__PXE_PORT__/discovery/bzImage init=${discoveryToplevel}/init initrd=initrd loglevel=4 pxe_server=__PXE_SERVER__ pxe_port=__PXE_PORT__
+            initrd http://__PXE_SERVER__:__PXE_PORT__/discovery/initrd
             boot
 
             # Installer boots
@@ -205,8 +206,8 @@ in
               ''
                 :install-${memberName}
                 echo Installing ${memberName}...
-                kernel http://''${next-server}:''${http-port}/${name}/bzImage init=${files.toplevel}/init initrd=initrd loglevel=4
-                initrd http://''${next-server}:''${http-port}/${name}/initrd
+                kernel http://__PXE_SERVER__:__PXE_PORT__/${name}/bzImage init=${files.toplevel}/init initrd=initrd loglevel=4
+                initrd http://__PXE_SERVER__:__PXE_PORT__/${name}/initrd
                 boot
               ''
             ) (lib.attrNames members)}
@@ -219,8 +220,8 @@ in
           pxeDir = pkgs.runCommand "${clusterName}-pxe-assets" { } ''
             mkdir -p $out
 
-            # Copy menu
-            cp ${pxeMenu} $out/menu.ipxe
+            # Copy menu template (will be processed at runtime)
+            cp ${pxeMenuTemplate} $out/menu.ipxe.template
 
             # Copy discovery image
             mkdir -p $out/discovery
@@ -249,6 +250,10 @@ in
           pxeConfig = cluster.provisioning.pxe or cfg.provisioning.pxe or { };
           interface = pxeConfig.interface or "eth0";
           httpPort = pxeConfig.httpPort or 8080;
+          # Installer names for symlinks
+          installerNames = lib.mapAttrsToList
+            (memberName: _: "${clusterName}-${memberName}-installer")
+            cluster.members;
         in
         pkgs.writeShellApplication {
           name = "${clusterName}-pxe-server";
@@ -307,6 +312,7 @@ in
             fi
 
             TFTP_ROOT=$(mktemp --directory --tmpdir nix8s-tftp.XXXXXX)
+            HTTP_ROOT=$(mktemp --directory --tmpdir nix8s-http.XXXXXX)
             NODES_DIR="$PROJECT_DIR/nix8s/nodes"
 
             echo "========================================"
@@ -325,7 +331,7 @@ in
             echo ""
 
             # Setup directories
-            mkdir -p "$TFTP_ROOT" "$NODES_DIR"
+            mkdir -p "$TFTP_ROOT" "$HTTP_ROOT" "$NODES_DIR"
 
             # Copy iPXE boot files
             cp ${ipxeUndionly} "$TFTP_ROOT/undionly.kpxe"
@@ -341,15 +347,25 @@ in
             echo "Server IP: $SERVER_IP"
             echo ""
 
-            # Create iPXE chain script with http-port variable
+            # Create iPXE chain script
             cat > "$TFTP_ROOT/boot.ipxe" << EOF
             #!ipxe
             dhcp
-            set http-port $HTTP_PORT
-            chain http://''${SERVER_IP}:''${HTTP_PORT}/menu.ipxe
+            chain http://$SERVER_IP:$HTTP_PORT/menu.ipxe
             EOF
 
-            export ASSETS_DIR="${pxeAssets}"
+            # Setup HTTP root with symlinks to assets and generated menu
+            ln -s ${pxeAssets}/discovery "$HTTP_ROOT/discovery"
+            ${lib.concatMapStringsSep "\n" (name:
+              ''ln -s ${pxeAssets}/${name} "$HTTP_ROOT/${name}"''
+            ) installerNames}
+
+            # Generate menu.ipxe from template with actual server IP and port
+            sed -e "s/__PXE_SERVER__/$SERVER_IP/g" \
+                -e "s/__PXE_PORT__/$HTTP_PORT/g" \
+                ${pxeAssets}/menu.ipxe.template > "$HTTP_ROOT/menu.ipxe"
+
+            export ASSETS_DIR="$HTTP_ROOT"
             export NODES_DIR="$NODES_DIR"
 
             echo "Starting HTTP server with API on port $HTTP_PORT..."
@@ -368,8 +384,8 @@ in
               if [[ -n "''${DNSMASQ_PID:-}" ]]; then
                 kill $DNSMASQ_PID 2>/dev/null || sudo kill $DNSMASQ_PID 2>/dev/null || true
               fi
-              echo "Cleaning up $TFTP_ROOT..."
-              rm -rf "$TFTP_ROOT"
+              echo "Cleaning up temporary directories..."
+              rm -rf "$TFTP_ROOT" "$HTTP_ROOT"
             }
             trap cleanup EXIT INT TERM
 
@@ -424,7 +440,7 @@ in
             echo "Discovered nodes: $NODES_DIR/*.nix"
             echo ""
             echo "Boot menu:"
-            cat ${pxeAssets}/menu.ipxe
+            cat "$HTTP_ROOT/menu.ipxe"
             echo ""
             echo "Press Ctrl+C to stop."
 
