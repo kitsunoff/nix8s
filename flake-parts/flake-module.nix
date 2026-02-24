@@ -16,6 +16,7 @@
         ./devshell.nix
         ./systems.nix
         ./apps/gen-secrets.nix
+        ./apps/fetch-kubeconfig.nix
       ];
     };
 
@@ -30,5 +31,6 @@
     devshell = ./devshell.nix;
     systems = ./systems.nix;
     gen-secrets = ./apps/gen-secrets.nix;
+    fetch-kubeconfig = ./apps/fetch-kubeconfig.nix;
   };
 }
