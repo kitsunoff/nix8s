@@ -367,7 +367,6 @@ nix8s.clusters.prod = {
     # LINSTOR distributed storage
     linstor = {
       enable = true;
-      partition.size = "100%";  # Use remaining disk space
       storage.poolName = "data";
       storage.type = "lvm";     # or "zfs"
     };
@@ -385,19 +384,15 @@ nix8s.clusters.prod = {
 
 ### LINSTOR Storage Options
 
+Storage disks are configured at **node level**:
+
 **Option 1: Partition on system disk (single disk nodes)**
 
 ```nix
-# Node config
 nix8s.nodes.my-node = {
   install.disk = "/dev/nvme0n1";
-  install.rootSize = "100G";  # Fixed root size, rest for LINSTOR
-};
-
-# Cluster config
-cozystack.linstor = {
-  enable = true;
-  partition.size = "100%";  # Use remaining space after root
+  install.rootSize = "100G";       # Fixed root size
+  linstor.partitionFromRoot = true; # Rest of disk for LINSTOR
 };
 ```
 

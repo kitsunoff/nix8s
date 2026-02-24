@@ -21,19 +21,19 @@ let
   linstorClusterCfg = cozystackCfg.linstor or { };
   linstorEnabled = linstorClusterCfg.enable or false;
 
-  # Node-level LINSTOR disk config (overrides cluster defaults)
+  # Node-level LINSTOR disk config
   nodeLinstorCfg = nodeConfig.linstor or { };
-  linstorDisk = nodeLinstorCfg.disk or null;        # single dedicated disk
-  linstorDisks = nodeLinstorCfg.disks or [ ];       # multiple dedicated disks
-  linstorPartitionSize = linstorClusterCfg.partition.size or null;  # partition on system disk
+  linstorDisk = nodeLinstorCfg.disk or null;              # single dedicated disk
+  linstorDisks = nodeLinstorCfg.disks or [ ];             # multiple dedicated disks
+  linstorPartitionFromRoot = nodeLinstorCfg.partitionFromRoot or false;  # use remaining space on system disk
 
   # Determine storage mode:
   # 1. linstor.disks = [ "/dev/sdb" "/dev/sdc" ] — multiple dedicated disks
   # 2. linstor.disk = "/dev/sdb" — single dedicated disk
-  # 3. install.rootSize + linstor.partition.size — partition on system disk
+  # 3. linstor.partitionFromRoot = true — partition from system disk (requires install.rootSize)
   hasLinstorDisks = linstorDisks != [ ];
   hasLinstorDisk = linstorDisk != null;
-  hasLinstorPartition = linstorEnabled && linstorPartitionSize != null && !hasLinstorDisk && !hasLinstorDisks;
+  hasLinstorPartition = linstorEnabled && linstorPartitionFromRoot && !hasLinstorDisk && !hasLinstorDisks;
 
   # Simple install mode: generate disko config from install.disk
   # Supports optional LINSTOR partition when cozystack.linstor.enable = true
@@ -99,7 +99,7 @@ let
             };
           } // lib.optionalAttrs hasLinstorPartition {
             linstor = {
-              size = linstorPartitionSize;
+              size = "100%";  # Use all remaining space after root
               # No content — raw partition for LINSTOR/LVM
             };
           };

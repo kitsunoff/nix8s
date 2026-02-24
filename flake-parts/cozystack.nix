@@ -65,7 +65,6 @@ in
           linstorEnabled = linstorCfg.enable or false;
           storagePoolName = linstorCfg.storage.poolName or "data";
           storageType = linstorCfg.storage.type or "lvm";  # lvm or zfs
-          linstorPartitionSize = linstorCfg.partition.size or null;
 
           # Resolve node config for a member
           resolveNodeConfig = memberName: member:
@@ -85,6 +84,7 @@ in
               # Node-level disk config
               linstorDisk = nodeLinstorCfg.disk or null;
               linstorDisks = nodeLinstorCfg.disks or [ ];
+              linstorPartitionFromRoot = nodeLinstorCfg.partitionFromRoot or false;
 
               # Determine devices for this node
               devices =
@@ -94,7 +94,7 @@ in
                 else if linstorDisk != null then
                   # Single dedicated disk
                   [ "/dev/disk/by-partlabel/disk-linstor-linstor" ]
-                else if linstorPartitionSize != null then
+                else if linstorPartitionFromRoot then
                   # Partition on system disk
                   [ "/dev/disk/by-partlabel/disk-main-linstor" ]
                 else
