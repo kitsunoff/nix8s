@@ -99,22 +99,11 @@ in
   # Add PXE server packages
   perSystem = { pkgs, system, ... }:
     let
-      # Download prebuilt iPXE binaries (works on all platforms)
-      # Legacy BIOS PXE boot
-      ipxeUndionly = pkgs.fetchurl {
-        url = "https://boot.ipxe.org/undionly.kpxe";
-        hash = "sha256-0cP6gBdipRgNChMqExesn7Jvv5M0ae1a8lv/0L9mSq0=";
-      };
-      # UEFI x86_64 boot (full iPXE with all drivers)
-      ipxeEfi = pkgs.fetchurl {
-        url = "https://boot.ipxe.org/x86_64-efi/ipxe.efi";
-        hash = "sha256-1opKhrjay/lVoIshRveu/0pkFq3WgzlI/Tj0HYEqAQ8=";
-      };
-      # UEFI x86_64 boot (SNP only - smaller, uses UEFI network stack)
-      ipxeSnponly = pkgs.fetchurl {
-        url = "https://boot.ipxe.org/x86_64-efi/snponly.efi";
-        hash = "sha256-jrpwZ1CZ5cBUUUy8E2EQvQT6lSxbuso+DV0Wu2R2X1M=";
-      };
+      # iPXE binaries (vendored in assets/ipxe/)
+      ipxeAssetsPath = ../assets/ipxe;
+      ipxeUndionly = ipxeAssetsPath + "/undionly.kpxe";  # Legacy BIOS PXE boot
+      ipxeEfi = ipxeAssetsPath + "/ipxe.efi";            # UEFI x86_64 boot (full iPXE)
+      ipxeSnponly = ipxeAssetsPath + "/snponly.efi";     # UEFI x86_64 boot (SNP only)
 
       # Build netboot assets for a cluster
       mkPxeAssets = clusterName: cluster:
