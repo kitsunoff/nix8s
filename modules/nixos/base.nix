@@ -16,10 +16,19 @@ let
   # SSH public key from cluster secrets (for node access)
   sshPubKey = cluster.secrets.sshPubKey or null;
 
+  # Cozystack/LINSTOR config
+  cozystackCfg = cluster.cozystack or { };
+  linstorCfg = cozystackCfg.linstor or { };
+  linstorEnabled = linstorCfg.enable or false;
+  linstorPartitionSize = linstorCfg.partition.size or null;
+  linstorDisk = linstorCfg.disk or null;
+
   # Simple install mode: generate disko config from install.disk
+  # Supports optional LINSTOR partition when cozystack.linstor.enable = true
   simpleDisko = disk: swapSize:
     let
       hasSwap = swapSize != null;
+      hasLinstorPartition = linstorEnabled && linstorPartitionSize != null && linstorDisk == null;
     in
     {
       devices.disk.main = {
@@ -48,12 +57,33 @@ let
             };
           } // {
             root = {
-              size = "100%";
+              # If LINSTOR partition needed, use fixed size; otherwise use all remaining space
+              size = if hasLinstorPartition then (nodeConfig.install.rootSize or "100G") else "100%";
               content = {
                 type = "filesystem";
                 format = "ext4";
                 mountpoint = "/";
               };
+            };
+          } // lib.optionalAttrs hasLinstorPartition {
+            linstor = {
+              size = linstorPartitionSize;
+              # No content — raw partition for LINSTOR/LVM
+            };
+          };
+        };
+      };
+    } // lib.optionalAttrs (linstorEnabled && linstorDisk != null) {
+      # Separate disk for LINSTOR
+      devices.disk.linstor = {
+        type = "disk";
+        device = linstorDisk;
+        content = {
+          type = "gpt";
+          partitions = {
+            linstor = {
+              size = "100%";
+              # No content — raw partition for LINSTOR/LVM
             };
           };
         };

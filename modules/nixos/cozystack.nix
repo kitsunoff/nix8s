@@ -11,6 +11,10 @@ let
   cozystackCfg = cluster.cozystack or { };
   enabled = cozystackCfg.enable or false;
 
+  # LINSTOR config
+  linstorCfg = cozystackCfg.linstor or { };
+  linstorEnabled = linstorCfg.enable or false;
+
   # Auto-bootstrap only on first server
   shouldBootstrap = enabled && isFirstServer && (cozystackCfg.autoBootstrap or true);
 
@@ -163,7 +167,23 @@ in
     boot.kernelModules = [
       "iscsi_tcp"
       "dm_multipath"
+    ] ++ lib.optionals linstorEnabled [
+      # DRBD kernel module for LINSTOR
+      "drbd"
     ];
+
+    # Firewall rules for LINSTOR/DRBD
+    networking.firewall = lib.mkIf linstorEnabled {
+      allowedTCPPorts = [
+        3366  # LINSTOR controller
+        3370  # LINSTOR satellite SSL
+        3376  # LINSTOR controller SSL
+        3377  # LINSTOR satellite
+      ];
+      allowedTCPPortRanges = [
+        { from = 7000; to = 8000; }  # DRBD replication
+      ];
+    };
 
     # Sysctl configuration for cozystack
     boot.kernel.sysctl = {
