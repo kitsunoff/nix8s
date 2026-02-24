@@ -191,7 +191,7 @@ in
             # Discovery boot
             :discovery
             echo Booting discovery image...
-            kernel http://''${next-server}:''${http-port}/discovery/bzImage init=${discoveryToplevel}/init initrd=initrd loglevel=4
+            kernel http://''${next-server}:''${http-port}/discovery/bzImage init=${discoveryToplevel}/init initrd=initrd loglevel=4 pxe_server=''${next-server} pxe_port=''${http-port}
             initrd http://''${next-server}:''${http-port}/discovery/initrd
             boot
 
@@ -247,22 +247,84 @@ in
         import json
         import os
         import sys
+        import re
         from datetime import datetime
         from pathlib import Path
         from urllib.parse import urlparse
 
-        DISCOVERED_NODES_FILE = os.environ.get("DISCOVERED_NODES_FILE", "/tmp/nix8s-discovered.json")
         ASSETS_DIR = os.environ.get("ASSETS_DIR", ".")
+        NODES_DIR = os.environ.get("NODES_DIR", "./nix8s/nodes")
 
-        def load_discovered():
-            if os.path.exists(DISCOVERED_NODES_FILE):
-                with open(DISCOVERED_NODES_FILE) as f:
-                    return json.load(f)
-            return {}
+        def mac_to_filename(mac: str) -> str:
+            """Convert MAC address to valid filename: aa:bb:cc:dd:ee:ff -> aabbccddeeff.nix"""
+            return re.sub(r'[:-]', "", mac.lower()) + ".nix"
 
-        def save_discovered(data):
-            with open(DISCOVERED_NODES_FILE, "w") as f:
-                json.dump(data, f, indent=2)
+        def generate_node_nix(data: dict) -> str:
+            """Generate Nix node file content with hardware info in comments."""
+            mac = data.get("mac", "unknown")
+            ip = data.get("ip", "unknown")
+            cpu = data.get("cpu", {})
+            memory_gb = data.get("memory_gb", 0)
+            disks = data.get("disks", [])
+            system = data.get("system", {})
+            discovered_at = data.get("discovered_at", "unknown")
+
+            # Format disks info
+            disk_lines = []
+            for disk in disks:
+                name = disk.get("name", "?")
+                size = disk.get("size", "?")
+                model = disk.get("model", "").strip() if disk.get("model") else ""
+                disk_lines.append(f"#   /dev/{name}: {size}" + (f" ({model})" if model else ""))
+
+            disks_str = "\n".join(disk_lines) if disk_lines else "#   (no disks found)"
+
+            return f'''# Discovered node: {mac}
+# Discovered at: {discovered_at}
+#
+# Hardware:
+#   CPU: {cpu.get("model", "unknown")} ({cpu.get("cores", "?")} cores)
+#   Memory: {memory_gb} GB
+#   System: {system.get("vendor", "")} {system.get("product", "")}
+#   Serial: {system.get("serial", "")}
+#
+# Network:
+#   MAC: {mac}
+#   IP: {ip} (at discovery time)
+#
+# Disks:
+{disks_str}
+#
+{{ ... }}:
+
+{{
+  nix8s.nodes."{mac_to_filename(mac)[:-4]}" = {{
+    network.mac = "{mac}";
+    install.disk = "/dev/{disks[0].get("name", "sda") if disks else "sda"}";
+  }};
+}}
+'''
+
+        def list_discovered_nodes() -> dict:
+            """List all discovered nodes from nix8s/nodes/*.nix files."""
+            nodes = {}
+            nodes_path = Path(NODES_DIR)
+            if not nodes_path.exists():
+                return nodes
+
+            for nix_file in nodes_path.glob("*.nix"):
+                # Skip non-MAC-address files (like standard.nix)
+                if not re.match(r'^[0-9a-f]{12}\.nix$', nix_file.name):
+                    continue
+
+                content = nix_file.read_text()
+                # Extract MAC from comment
+                mac_match = re.search(r'# Discovered node: ([0-9a-f:]+)', content)
+                if mac_match:
+                    mac = mac_match.group(1)
+                    nodes[mac] = {"file": str(nix_file), "mac": mac}
+
+            return nodes
 
         class PXEHandler(http.server.SimpleHTTPRequestHandler):
             def __init__(self, *args, **kwargs):
@@ -272,10 +334,10 @@ in
                 parsed = urlparse(self.path)
 
                 if parsed.path == "/api/nodes":
-                    self.send_json(load_discovered())
+                    self.send_json(list_discovered_nodes())
                 elif parsed.path.startswith("/api/nodes/"):
                     mac = parsed.path.split("/")[-1].lower().replace("-", ":")
-                    nodes = load_discovered()
+                    nodes = list_discovered_nodes()
                     if mac in nodes:
                         self.send_json(nodes[mac])
                     else:
@@ -294,9 +356,15 @@ in
                             self.send_error(400, "Missing MAC address")
                             return
 
-                        nodes = load_discovered()
-                        nodes[mac] = data
-                        save_discovered(nodes)
+                        # Create nodes directory if needed
+                        nodes_path = Path(NODES_DIR)
+                        nodes_path.mkdir(parents=True, exist_ok=True)
+
+                        # Write node file
+                        filename = mac_to_filename(mac)
+                        filepath = nodes_path / filename
+                        nix_content = generate_node_nix(data)
+                        filepath.write_text(nix_content)
 
                         print(f"\n{'='*50}")
                         print(f"NEW NODE DISCOVERED: {mac}")
@@ -304,9 +372,11 @@ in
                         print(f"CPU: {data.get('cpu', {}).get('model', 'unknown')}")
                         print(f"Memory: {data.get('memory_gb', 'unknown')} GB")
                         print(f"Disks: {len(data.get('disks', []))}")
+                        print(f"")
+                        print(f"Created: {filepath}")
                         print(f"{'='*50}\n")
 
-                        self.send_json({"status": "ok", "mac": mac})
+                        self.send_json({"status": "ok", "mac": mac, "file": str(filepath)})
                     except json.JSONDecodeError:
                         self.send_error(400, "Invalid JSON")
                 else:
@@ -325,7 +395,7 @@ in
             server = http.server.HTTPServer(("0.0.0.0", port), PXEHandler)
             print(f"PXE HTTP server listening on port {port}")
             print(f"Assets directory: {ASSETS_DIR}")
-            print(f"Discovered nodes file: {DISCOVERED_NODES_FILE}")
+            print(f"Nodes directory: {NODES_DIR}")
             print()
             print("API endpoints:")
             print("  GET  /api/nodes         - List all discovered nodes")
@@ -343,7 +413,6 @@ in
           interface = pxeConfig.interface or "eth0";
           httpPort = pxeConfig.httpPort or 8080;
           tftpRoot = pxeConfig.tftpRoot or "/tmp/nix8s-tftp";
-          dataDir = pxeConfig.dataDir or "/tmp/nix8s-data";
         in
         pkgs.writeShellApplication {
           name = "${clusterName}-pxe-server";
@@ -351,10 +420,58 @@ in
           text = ''
             set -euo pipefail
 
-            INTERFACE="''${1:-${interface}}"
-            HTTP_PORT="''${2:-${toString httpPort}}"
+            # Find project root (directory with flake.nix)
+            find_project_root() {
+              local dir="$PWD"
+              while [[ "$dir" != "/" ]]; do
+                if [[ -f "$dir/flake.nix" ]]; then
+                  echo "$dir"
+                  return 0
+                fi
+                dir="$(dirname "$dir")"
+              done
+              echo "$PWD"  # fallback to current dir
+            }
+
+            # Parse arguments
+            INTERFACE="${interface}"
+            HTTP_PORT="${toString httpPort}"
+            PROJECT_DIR=""
+
+            while [[ $# -gt 0 ]]; do
+              case $1 in
+                --interface)
+                  INTERFACE="$2"
+                  shift 2
+                  ;;
+                --port)
+                  HTTP_PORT="$2"
+                  shift 2
+                  ;;
+                --project-dir)
+                  PROJECT_DIR="$2"
+                  shift 2
+                  ;;
+                *)
+                  # Legacy positional args: interface port
+                  if [[ -z "''${POSITIONAL_SET:-}" ]]; then
+                    INTERFACE="$1"
+                    POSITIONAL_SET=1
+                  else
+                    HTTP_PORT="$1"
+                  fi
+                  shift
+                  ;;
+              esac
+            done
+
+            # Use provided project dir or find it
+            if [[ -z "$PROJECT_DIR" ]]; then
+              PROJECT_DIR="$(find_project_root)"
+            fi
+
             TFTP_ROOT="${tftpRoot}"
-            DATA_DIR="${dataDir}"
+            NODES_DIR="$PROJECT_DIR/nix8s/nodes"
 
             echo "========================================"
             echo " nix8s PXE Server"
@@ -363,6 +480,8 @@ in
             echo ""
             echo "Interface: $INTERFACE"
             echo "HTTP Port: $HTTP_PORT"
+            echo "Project:   $PROJECT_DIR"
+            echo "Nodes dir: $NODES_DIR"
             echo ""
             echo "Supported boot modes:"
             echo "  - Legacy BIOS (undionly.kpxe)"
@@ -370,7 +489,7 @@ in
             echo ""
 
             # Setup directories
-            mkdir -p "$TFTP_ROOT" "$DATA_DIR"
+            mkdir -p "$TFTP_ROOT" "$NODES_DIR"
 
             # Copy iPXE boot files
             cp ${ipxeUndionly} "$TFTP_ROOT/undionly.kpxe"
@@ -395,7 +514,7 @@ in
             EOF
 
             export ASSETS_DIR="${pxeAssets}"
-            export DISCOVERED_NODES_FILE="$DATA_DIR/discovered.json"
+            export NODES_DIR="$NODES_DIR"
 
             echo "Starting HTTP server with API on port $HTTP_PORT..."
             echo ""
@@ -426,6 +545,7 @@ in
               --port=0 \
               --interface="$INTERFACE" \
               --bind-interfaces \
+              --leasefile-ro \
               --dhcp-range="$SERVER_IP,proxy" \
               --dhcp-match=set:ipxe,175 \
               --dhcp-match=set:bios,option:client-arch,0 \
@@ -451,7 +571,7 @@ in
             echo "  http://$SERVER_IP:$HTTP_PORT/api/nodes     - List discovered nodes"
             echo "  http://$SERVER_IP:$HTTP_PORT/menu.ipxe     - Boot menu"
             echo ""
-            echo "Discovered nodes file: $DATA_DIR/discovered.json"
+            echo "Discovered nodes: $NODES_DIR/*.nix"
             echo ""
             echo "Boot menu:"
             cat ${pxeAssets}/menu.ipxe

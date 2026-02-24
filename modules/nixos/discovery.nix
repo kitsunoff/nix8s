@@ -110,9 +110,17 @@ let
     echo ""
     echo "Reporting to PXE server..."
 
-    # Get server IP from DHCP (next-server or gateway)
-    SERVER_IP=$(ip route | grep default | awk '{print $3}')
-    REPORT_URL="http://''${SERVER_IP}:8080/api/discover"
+    # Get server IP and port from kernel cmdline (set by iPXE)
+    SERVER_IP=$(grep -oP 'pxe_server=\K[^\s]+' /proc/cmdline || echo "")
+    SERVER_PORT=$(grep -oP 'pxe_port=\K[^\s]+' /proc/cmdline || echo "8080")
+
+    # Fallback to gateway if not provided
+    if [[ -z "$SERVER_IP" ]]; then
+      SERVER_IP=$(ip route | grep default | awk '{print $3}')
+      echo "Warning: pxe_server not in cmdline, using gateway: $SERVER_IP"
+    fi
+
+    REPORT_URL="http://''${SERVER_IP}:''${SERVER_PORT}/api/discover"
 
     if ${pkgs.curl}/bin/curl -s -X POST \
         -H "Content-Type: application/json" \
