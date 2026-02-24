@@ -25,7 +25,7 @@ in
         in
         pkgs.writeShellApplication {
           name = "${nodeName}-upgrade";
-          runtimeInputs = with pkgs; [ kubectl openssh nixos-rebuild ];
+          runtimeInputs = with pkgs; [ kubectl openssh nix coreutils bc ];
           text = ''
             set -euo pipefail
 
@@ -78,16 +78,23 @@ in
               echo ""
             fi
 
-            # Rebuild
-            echo "Building and switching configuration..."
-            echo "Running: nixos-rebuild switch --flake $FLAKE_REF#$NODE_NAME --target-host $SSH_USER@$NODE_IP"
+            # Build locally
+            echo "Building configuration locally..."
+            SYSTEM_PATH=$(nix build "$FLAKE_REF#nixosConfigurations.$NODE_NAME.config.system.build.toplevel" --print-out-paths --no-link)
+            echo "Built: $SYSTEM_PATH"
             echo ""
 
-            if nixos-rebuild switch \
-                --flake "$FLAKE_REF#$NODE_NAME" \
-                --target-host "$SSH_USER@$NODE_IP" \
-                --build-host localhost \
-                --use-remote-sudo; then
+            # Copy to target
+            echo "Copying to $NODE_IP..."
+            nix copy --to "ssh://$SSH_USER@$NODE_IP" "$SYSTEM_PATH"
+            echo "✓ Copied"
+            echo ""
+
+            # Activate on target
+            echo "Activating configuration..."
+            # shellcheck disable=SC2086
+            if ssh $SSH_OPTS "$SSH_USER@$NODE_IP" \
+                "nix-env --profile /nix/var/nix/profiles/system --set '$SYSTEM_PATH' && /nix/var/nix/profiles/system/bin/switch-to-configuration switch"; then
               echo ""
               echo "✓ Configuration deployed"
             else
@@ -176,7 +183,7 @@ in
         in
         pkgs.writeShellApplication {
           name = "${clusterName}-upgrade";
-          runtimeInputs = with pkgs; [ kubectl openssh nixos-rebuild bc ];
+          runtimeInputs = with pkgs; [ kubectl openssh nix coreutils bc ];
           text = ''
             set -euo pipefail
 
@@ -274,13 +281,32 @@ in
                 echo "✓ Drained"
               fi
 
-              # Rebuild
-              echo "Deploying configuration..."
-              if nixos-rebuild switch \
-                  --flake "$FLAKE_REF#$node_name" \
-                  --target-host "$SSH_USER@$node_ip" \
-                  --build-host localhost \
-                  --use-remote-sudo; then
+              # Build locally
+              echo "Building configuration..."
+              SYSTEM_PATH=$(nix build "$FLAKE_REF#nixosConfigurations.$node_name.config.system.build.toplevel" --print-out-paths --no-link)
+              echo "Built: $SYSTEM_PATH"
+
+              # Copy to target
+              echo "Copying to $node_ip..."
+              if ! nix copy --to "ssh://$SSH_USER@$node_ip" "$SYSTEM_PATH"; then
+                echo "✗ Copy FAILED"
+                FAILED_NODES+=("$node_name")
+
+                if [ "$SKIP_DRAIN" != "1" ]; then
+                  kubectl uncordon "$node_name" || true
+                  CORDONED_NODES=("''${CORDONED_NODES[@]/$node_name}")
+                fi
+
+                echo "Stopping upgrade due to failure"
+                return 1
+              fi
+              echo "✓ Copied"
+
+              # Activate on target
+              echo "Activating configuration..."
+              # shellcheck disable=SC2086
+              if ssh $SSH_OPTS "$SSH_USER@$node_ip" \
+                  "nix-env --profile /nix/var/nix/profiles/system --set '$SYSTEM_PATH' && /nix/var/nix/profiles/system/bin/switch-to-configuration switch"; then
                 echo "✓ Deployed"
               else
                 echo "✗ Deployment FAILED"
