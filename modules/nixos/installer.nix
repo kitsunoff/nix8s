@@ -83,6 +83,16 @@ in
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
 
+    path = with pkgs; [
+      nixos-install-tools
+      nix
+      parted
+      dosfstools
+      e2fsprogs
+      util-linux
+      coreutils
+    ];
+
     serviceConfig = {
       Type = "oneshot";
       ExecStart = installScript;
