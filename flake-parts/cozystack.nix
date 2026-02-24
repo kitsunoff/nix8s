@@ -66,11 +66,43 @@ in
           storagePoolName = linstorCfg.storage.poolName or "data";
           storageType = linstorCfg.storage.type or "lvm";  # lvm or zfs
 
+          # MetalLB configuration
+          metallbCfg = cozystackCfg.metallb or { };
+          metallbEnabled = metallbCfg.enable or false;
+          metallbAddresses = metallbCfg.addresses or [ ];  # e.g. ["192.168.100.200-192.168.100.250"]
+          metallbMode = metallbCfg.mode or "l2";  # l2 or bgp
+          metallbPoolName = metallbCfg.poolName or "cozystack";
+
           # Build node list with partition info
           memberNodes = lib.mapAttrsToList (memberName: member: {
             name = "${clusterName}-${memberName}";
             ip = member.ip;
           }) cluster.members;
+
+          # MetalLB manifests
+          metallbPoolYaml = pkgs.writeText "metallb-pool.yaml" ''
+            apiVersion: metallb.io/v1beta1
+            kind: IPAddressPool
+            metadata:
+              name: ${metallbPoolName}
+              namespace: cozy-metallb
+            spec:
+              addresses:
+                ${lib.concatMapStringsSep "\n    " (addr: "- ${addr}") metallbAddresses}
+              autoAssign: true
+              avoidBuggyIPs: false
+          '';
+
+          metallbL2AdvYaml = pkgs.writeText "metallb-l2-advertisement.yaml" ''
+            apiVersion: metallb.io/v1beta1
+            kind: L2Advertisement
+            metadata:
+              name: ${metallbPoolName}
+              namespace: cozy-metallb
+            spec:
+              ipAddressPools:
+                - ${metallbPoolName}
+          '';
 
           # StorageClass manifests
           storageClassesYaml = pkgs.writeText "linstor-storageclasses.yaml" ''
@@ -254,6 +286,75 @@ in
               echo "========================================"
               echo " LINSTOR setup complete!"
               echo "========================================"
+              echo ""
+              echo "Next step - setup networking:"
+              echo "  nix run .#${clusterName}-metallb-setup"
+            '';
+          };
+        } // lib.optionalAttrs metallbEnabled {
+          "${clusterName}-metallb-setup" = pkgs.writeShellApplication {
+            name = "${clusterName}-metallb-setup";
+            runtimeInputs = with pkgs; [ kubectl ];
+            text = ''
+              set -euo pipefail
+
+              echo "========================================"
+              echo " MetalLB Networking Setup"
+              echo " Cluster: ${clusterName}"
+              echo " Pool: ${metallbPoolName}"
+              echo " Mode: ${metallbMode}"
+              echo " Addresses: ${lib.concatStringsSep ", " metallbAddresses}"
+              echo "========================================"
+              echo ""
+
+              # Check MetalLB is deployed
+              echo "Checking MetalLB deployment..."
+              if ! kubectl get ns cozy-metallb &>/dev/null; then
+                echo "ERROR: cozy-metallb namespace not found"
+                echo "Make sure cozystack is fully deployed first"
+                exit 1
+              fi
+              echo "MetalLB namespace exists"
+              echo ""
+
+              # Apply IP Address Pool
+              echo "Creating IP Address Pool..."
+              kubectl apply -f ${metallbPoolYaml}
+              echo ""
+
+              # Apply L2 Advertisement (for l2 mode)
+              ${lib.optionalString (metallbMode == "l2") ''
+                echo "Creating L2 Advertisement..."
+                kubectl apply -f ${metallbL2AdvYaml}
+                echo ""
+              ''}
+
+              # Enable ingress on root tenant
+              echo "Enabling ingress on root tenant..."
+              kubectl patch -n tenant-root tenants.apps.cozystack.io root \
+                --type=merge \
+                -p '{"spec":{"ingress": true}}' || echo "Tenant may not exist yet"
+              echo ""
+
+              # Verify
+              echo "IP Address Pools:"
+              kubectl get ipaddresspools -n cozy-metallb
+              echo ""
+
+              echo "L2 Advertisements:"
+              kubectl get l2advertisements -n cozy-metallb
+              echo ""
+
+              echo "Checking ingress controller..."
+              kubectl get svc -n tenant-root 2>/dev/null | grep ingress || echo "Ingress not ready yet"
+              echo ""
+
+              echo "========================================"
+              echo " MetalLB setup complete!"
+              echo "========================================"
+              echo ""
+              echo "Your cluster is now accessible via:"
+              echo "  https://${host}"
             '';
           };
         };
