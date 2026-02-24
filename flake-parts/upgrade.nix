@@ -92,7 +92,7 @@ in
 
             # Activate on target
             echo "Activating configuration..."
-            # shellcheck disable=SC2086
+            # shellcheck disable=SC2086,SC2029
             if ssh $SSH_OPTS "$SSH_USER@$NODE_IP" \
                 "nix-env --profile /nix/var/nix/profiles/system --set '$SYSTEM_PATH' && /nix/var/nix/profiles/system/bin/switch-to-configuration switch"; then
               echo ""
@@ -304,7 +304,7 @@ in
 
               # Activate on target
               echo "Activating configuration..."
-              # shellcheck disable=SC2086
+              # shellcheck disable=SC2086,SC2029
               if ssh $SSH_OPTS "$SSH_USER@$node_ip" \
                   "nix-env --profile /nix/var/nix/profiles/system --set '$SYSTEM_PATH' && /nix/var/nix/profiles/system/bin/switch-to-configuration switch"; then
                 echo "✓ Deployed"
