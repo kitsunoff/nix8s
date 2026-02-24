@@ -151,6 +151,8 @@ in
       multipath-tools
       kubectl
       curl
+    ] ++ lib.optionals linstorEnabled [
+      drbd  # drbd-utils (drbdadm, drbdsetup, drbdmeta)
     ];
 
     # Enable required services
@@ -169,8 +171,13 @@ in
       "iscsi_tcp"
       "dm_multipath"
     ] ++ lib.optionals linstorEnabled [
-      # DRBD kernel module for LINSTOR
+      # DRBD kernel module for LINSTOR (drbd9, not built-in drbd8)
       "drbd"
+    ];
+
+    # DRBD 9 kernel module (LINSTOR requires DRBD 9, not built-in DRBD 8)
+    boot.extraModulePackages = lib.optionals linstorEnabled [
+      config.boot.kernelPackages.drbd
     ];
 
     # Firewall rules for Cozystack components
