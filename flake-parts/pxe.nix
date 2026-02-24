@@ -492,9 +492,9 @@ in
             mkdir -p "$TFTP_ROOT" "$NODES_DIR"
 
             # Copy iPXE boot files
-            install --mode=644 ${ipxeUndionly} "$TFTP_ROOT/undionly.kpxe"
-            install --mode=644 ${ipxeEfi} "$TFTP_ROOT/ipxe.efi"
-            install --mode=644 ${ipxeSnponly} "$TFTP_ROOT/snponly.efi"
+            cp ${ipxeUndionly} "$TFTP_ROOT/undionly.kpxe"
+            cp ${ipxeEfi} "$TFTP_ROOT/ipxe.efi"
+            cp ${ipxeSnponly} "$TFTP_ROOT/snponly.efi"
 
             # Get server IP (cross-platform: Linux and macOS)
             if command -v ip &> /dev/null; then
