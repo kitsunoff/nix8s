@@ -50,7 +50,7 @@ Describe a cluster once — members, roles, modules — and `converge` installs 
 | **Install** | `nixos-anywhere` for a host with no NixOS on it yet, decided by an SSH probe — so the step as a whole is idempotent even though installing is not. |
 | **Converge** | A dependency graph, not a fixed pipeline: secrets before members, non-first servers after the bootstrap, agents after **all** servers, post-ops after the members they need. |
 | **Join** | Module-specific runtime work that a NixOS switch cannot do: minting Incus join tokens, fetching a kubeconfig. Idempotent — an already-joined member is skipped and says so. |
-| **Prune** | Members that left the definition are drained, deregistered and removed from the cluster's own registry — and for the nebula mesh, where removal has to mean revocation, their certificate fingerprint is blocklisted. Reported as `action: "removed"` in the result JSON. |
+| **Prune** | Members that left the definition are drained, deregistered and removed from the cluster's own registry. What that means is module-specific: for the nebula mesh, where removal has to mean revocation, the certificate fingerprint is blocklisted; for keepalived, the departed host's VRRP daemon is stopped and the survivors' peer list is rebuilt. Reported as `action: "removed"` in the result JSON. |
 
 ## Start from a scenario template
 
@@ -116,7 +116,7 @@ Nothing is auto-applied: a cluster imports what it wants.
 | `incus` | Incus on every member; with `incus.cluster.enable`, runtime join tokens for members that never set a per-member patch, plus a prune step |
 | `sops` | age-encrypted cluster secrets, generate-if-missing, delivered to hosts outside the Nix store |
 | `nebula` | a Nebula mesh with a per-cluster CA and per-member certificates, plus a prune step that **revokes** a departed member's certificate |
-| `keepalived` | VRRP virtual addresses across members |
+| `keepalived` | VRRP virtual addresses across members, a reconcile step that re-renders and reloads the peer list, and a prune step |
 | `disko` | declarative partitioning for the install step |
 | `cozystack` | Cozystack platform bootstrap on top of k3s |
 | `pxe` | a PXE server for provisioning members that cannot be reached over SSH yet |
@@ -208,7 +208,7 @@ $ scripts/check-templates.sh
 24 check(s) passed, 0 failed
 
 $ scripts/check-prune.sh
-89 check(s) passed, 0 failed
+157 check(s) passed, 0 failed
 ```
 
 `check-templates.sh` locks every registered template against the checkout and
@@ -228,6 +228,14 @@ the fingerprints asserted on are the ones nebula itself would match. Those check
 assert the blocklist rather than the host map (a host map entry is not a
 revocation), that an earlier revocation survives a later one, and that a mesh with
 no members left fails loudly instead of revoking everything.
+
+The keepalived part asserts the survivors' **running** `keepalived.conf` after the
+reload, never that a reload command was issued — a reload that re-read nothing
+exits 0 exactly like one that worked, so the check includes a host whose reload
+changes nothing and requires the step to fail on it. It also covers the removal of
+the node holding the VIP: the survivors must come back with one of them elected
+MASTER at the higher priority, and a run that leaves nobody claiming the address
+fails.
 
 ## Architecture
 
@@ -253,14 +261,20 @@ modules share, so the dangerous logic exists exactly once.
 ## Known limitations
 
 - **Pruning has never run against a live cluster.** The engine and the k3s and
-  nebula steps are covered by stubbed tests; the Incus path is verified only by
-  evaluation.
-- **`keepalived` does not prune.**
+  nebula and keepalived steps are covered by stubbed tests; the Incus path is
+  verified only by evaluation. In particular, nothing here has yet observed a real
+  keepalived pick up a changed `unicast_peer` list on SIGHUP — that behaviour is
+  taken from keepalived(8), and the check asserts the config the daemon is handed,
+  not the daemon's reaction to it.
 - **A nebula revocation lands on the survivors at the next converge.** The
   blocklist is a build input, so the run that records a departure is not the run
   that hands the new list to the remaining hosts: commit the file and converge
   again. Until then the departed host is out of the lighthouse host map but its
   certificate is still accepted.
+- **keepalived pruning depends on the participation ledger.** A member that left
+  before this ledger existed leaves no registry entry behind, so the first converge
+  after upgrading has nothing to prune for it; the departed host's keepalived has
+  to be stopped by hand that once.
 - **Per-member converge status is coarse.** The result JSON reports one action per
   member, not a step-by-step trace.
 - **`converge` builds where it runs.** There is no `--build-host`, so driving it
