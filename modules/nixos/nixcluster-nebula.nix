@@ -11,6 +11,12 @@ let
   cluster = nixcluster.cluster;
   memberName = nixcluster.memberName;
 
+  # The name this host goes by in the mesh: its certificate's subject and the key
+  # its cert/key are filed under in sops. Core's canonical member -> registry-name
+  # mapping, the same one the cluster module signs with and the prune step diffs
+  # against — if these two ever disagreed, a rename would look like a departure.
+  meshName = cluster.memberRegistryNames.${memberName} or memberName;
+
   sopsEnabled = cluster.sops.enable or false;
   netName = cluster.nebula.network or "nixcluster";
 
@@ -53,6 +59,22 @@ in
       default = 4242;
       description = "UDP port Nebula listens on (underlay).";
     };
+
+    blocklist = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "c99d4e650533b92061b09918e838a5a0a6aaee21eed1d12fd937682865936c72" ];
+      description = ''
+        Certificate fingerprints this host refuses to talk to, rendered as
+        `pki.blocklist` in its nebula config. Set for every member by the nebula
+        cluster module from `nebula.blocklistFile`; nebula lighthouses do not
+        distribute the blocklist, so each host has to carry the whole list.
+
+        This is nebula's only revocation mechanism short of rotating the CA: a
+        certificate that is signed and unexpired is accepted no matter what the
+        lighthouse host map says.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -60,16 +82,24 @@ in
     # PRIVATE key is intentionally NOT declared here — it never lands on a node.
     sops.secrets = lib.mkIf sopsEnabled {
       "nebula/ca/crt" = { };
-      "nebula/${memberName}/crt" = { };
-      "nebula/${memberName}/key" = { };
+      "nebula/${meshName}/crt" = { };
+      "nebula/${meshName}/key" = { };
     };
 
     services.nebula.networks.${netName} = {
       enable = true;
 
       ca = if sopsEnabled then config.sops.secrets."nebula/ca/crt".path else "/etc/nebula/ca.crt";
-      cert = if sopsEnabled then config.sops.secrets."nebula/${memberName}/crt".path else "/etc/nebula/host.crt";
-      key = if sopsEnabled then config.sops.secrets."nebula/${memberName}/key".path else "/etc/nebula/host.key";
+      cert = if sopsEnabled then config.sops.secrets."nebula/${meshName}/crt".path else "/etc/nebula/host.crt";
+      key = if sopsEnabled then config.sops.secrets."nebula/${meshName}/key".path else "/etc/nebula/host.key";
+
+      # Revocation. `pki` is HUPable upstream, but the nixpkgs module's
+      # `enableReload` applies reload-instead-of-restart to EVERY config change,
+      # including the ones nebula cannot reload (listen.port, tun.dev,
+      # lighthouse.am_lighthouse) — that trades a silent no-op for a brief
+      # reconnect. Left at the default, so a blocklist change restarts nebula and
+      # certainly takes effect.
+      settings.pki.blocklist = cfg.blocklist;
 
       isLighthouse = cfg.isLighthouse;
       # Non-lighthouses point at the lighthouses for discovery.
