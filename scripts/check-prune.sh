@@ -13,6 +13,13 @@
 #            stub `kubectl` and `ssh` binaries on PATH. This is what checks that
 #            the module's own commands are wired to the engine correctly.
 #
+#   Part C — the REAL nebula prune step, against real certificates. Leaving a mesh
+#            is a REVOCATION: the checks assert the blocklist, not just the host
+#            map, because a host dropped from the host map keeps a valid
+#            certificate and can still reach peers directly. They also assert that
+#            the blocklist ACCUMULATES — a list rebuilt from the current members
+#            would silently restore every host revoked so far.
+#
 # Usage: scripts/check-prune.sh
 # Exit status is non-zero on the first failed expectation.
 
@@ -60,6 +67,28 @@ expect_exit() {
     ok "$1"
   else
     fail "$1: exit $3, want $2"
+  fi
+}
+
+# expect_eq <what> <expected> <actual>
+expect_eq() {
+  if [[ "$2" == "$3" ]]; then
+    ok "$1"
+  else
+    fail "$1
+      expected: $2
+      actual:   $3"
+  fi
+}
+
+# expect_no_file <what> <path>
+expect_no_file() {
+  if [[ -e "$2" ]]; then
+    fail "$1
+      did NOT expect this file to exist: $2
+$(sed 's/^/        /' "$2")"
+  else
+    ok "$1"
   fi
 }
 
@@ -257,6 +286,261 @@ expect_exit "succeeds" 0 "$ENGINE_RC"
 expect_contains "cordons first" "$STUB_CALLS" "cordon old-worker"
 expect_contains "drains with a bounded timeout" "$STUB_CALLS" "--timeout=120s"
 expect_contains "stops the k3s unit on the host" "$STUB_CALLS" "systemctl stop k3s"
+
+# ---------------------------------------------------------------------------
+# Part C — the real nebula prune step, against real certificates.
+#
+# Only `sops` and `ssh` are stubbed. `nebula-cert` is the real tool, so the
+# fingerprints these checks assert on are the ones nebula itself would compute
+# and match against pki.blocklist.
+# ---------------------------------------------------------------------------
+printf '\n==> Part C: the nebula prune step (revocation, not just the host map)\n'
+
+# The same nebula the step runs, so a fingerprint computed here is the fingerprint
+# the step records.
+TOOLS="$("${NIX[@]}" build --impure --no-link --print-out-paths --expr '
+  let pkgs = (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem};
+  in pkgs.buildEnv { name = "nixcluster-prune-check-tools"; paths = [ pkgs.nebula pkgs.jq ]; }
+' 2>&1 | tail -n 1)"
+[[ -x "$TOOLS/bin/nebula-cert" ]] || { echo "could not provision nebula-cert/jq: $TOOLS" >&2; exit 1; }
+PATH="$TOOLS/bin:$PATH"
+
+# --- a real mesh PKI --------------------------------------------------------
+PKI="$WORK_DIR/pki"
+mkdir -p "$PKI"
+nebula-cert ca -name mesh -out-crt "$PKI/ca.crt" -out-key "$PKI/ca.key"
+sign_host() { # name overlay-ip
+  nebula-cert sign -ca-crt "$PKI/ca.crt" -ca-key "$PKI/ca.key" \
+    -name "$1" -ip "$2" -out-crt "$PKI/$1.crt" -out-key "$PKI/$1.key"
+}
+fingerprint() { # name
+  nebula-cert print -json -path "$PKI/$1.crt" | jq --raw-output '.[0].fingerprint'
+}
+
+# node1 + mesh-node-2 are the cluster's members (mesh-node-2 is the member that
+# sets networking.hostName, so it is only matched if the module uses core's
+# canonical registry-name mapping). old-node is the departure under test;
+# ancient-node left some converges ago and is already revoked.
+sign_host node1 192.168.100.1/24
+sign_host mesh-node-2 192.168.100.2/24
+sign_host old-node 192.168.100.9/24
+sign_host ancient-node 192.168.100.8/24
+
+FP_OLD="$(fingerprint old-node)"
+FP_ANCIENT="$(fingerprint ancient-node)"
+
+# The plaintext the stubbed `sops --decrypt` hands back: every certificate ever
+# issued for this mesh, which is what makes it the registry.
+mesh_secrets() { # out-file host...
+  local out="$1"; shift
+  local args=(--rawfile ca "$PKI/ca.crt") filter='{nebula:{ca:{crt:$ca}'
+  local host i=0
+  # jq variable names take no dashes, so the certificates are numbered.
+  for host in "$@"; do
+    args+=(--rawfile "crt$i" "$PKI/$host.crt" --rawfile "key$i" "$PKI/$host.key")
+    filter+=",\"$host\":{crt:\$crt$i,key:\$key$i}"
+    i=$((i + 1))
+  done
+  filter+='}}'
+  jq --null-input "${args[@]}" "$filter" > "$out"
+}
+mesh_secrets "$WORK_DIR/secrets-departed.json" node1 mesh-node-2 old-node ancient-node
+mesh_secrets "$WORK_DIR/secrets-converged.json" node1 mesh-node-2 ancient-node
+
+# The blocklist as the CONFIGURATION sees it (nebula.blocklistFile): ancient-node
+# was revoked in an earlier converge and its fingerprint is compiled into every
+# host's pki.blocklist.
+blocklist_with() { # out-file name fingerprint...
+  local out="$1"; shift
+  printf '{"revoked":[' > "$out"
+  local sep=""
+  while [[ $# -gt 0 ]]; do
+    printf '%s{"name":"%s","fingerprint":"%s","network":"mesh","revokedAt":"2026-01-01T00:00:00+00:00"}' \
+      "$sep" "$1" "$2" >> "$out"
+    sep=","
+    shift 2
+  done
+  printf ']}\n' >> "$out"
+}
+blocklist_with "$WORK_DIR/wired.json" ancient-node "$FP_ANCIENT"
+blocklist_with "$WORK_DIR/wired-old.json" old-node "$FP_OLD"
+
+# --- the steps --------------------------------------------------------------
+build_mesh_step() { # cluster blocklist-file-or-empty [step binary] -> executable
+  local cluster="$1" blocklist="$2" step="${3:-nebula.prune}"
+  local binary="${4:-nixcluster-prune-nebula}"
+  local args=(build --impure --no-link --print-out-paths
+    --file "$REPO_ROOT/scripts/prune-stubs.nix" --argstr repoRoot "$REPO_ROOT"
+    --argstr cluster "$cluster" --argstr step "$step")
+  [[ -n "$blocklist" ]] && args+=(--argstr blocklistFile "$blocklist")
+  printf '%s/bin/%s\n' "$("${NIX[@]}" "${args[@]}" 2>&1 | tail -n 1)" "$binary"
+}
+
+MESH_PRUNE="$(build_mesh_step mesh "$WORK_DIR/wired.json")"
+[[ -x "$MESH_PRUNE" ]] || { echo "could not build the nebula prune step: $MESH_PRUNE" >&2; exit 1; }
+
+MESH_BLOCKLIST="secrets/mesh.nebula-blocklist.json"
+
+run_mesh_prune() { # step secrets-fixture reachable seed-blocklist|""
+  local exe="$1" secrets="$2" reachable="$3" seed="${4:-}"
+  export STUB_CALLS="$WORK_DIR/mesh-calls"
+  export STUB_SECRETS="$secrets"
+  export STUB_REACHABLE="$WORK_DIR/mesh-reachable"
+  printf '%s\n' "$reachable" > "$STUB_REACHABLE"
+  : > "$STUB_CALLS"
+  rm -rf "$WORK_DIR/mesh-run"
+  mkdir -p "$WORK_DIR/mesh-run/secrets"
+  # The step needs the sops file and the age key converge would have produced;
+  # their CONTENT comes from the stub, their presence is what it checks.
+  : > "$WORK_DIR/mesh-run/secrets/mesh.yaml"
+  : > "$WORK_DIR/mesh-run/secrets/mesh.age.key"
+  [[ -n "$seed" ]] && cp "$seed" "$WORK_DIR/mesh-run/$MESH_BLOCKLIST"
+  ENGINE_OUT="$WORK_DIR/mesh-out"
+  set +e
+  (cd "$WORK_DIR/mesh-run" && "$exe") > "$ENGINE_OUT" 2>&1
+  ENGINE_RC=$?
+  set -e
+}
+
+# blocklist_fingerprints — the fingerprints the run left behind, sorted.
+blocklist_fingerprints() {
+  jq --raw-output '[.revoked[].fingerprint] | sort | join(" ")' \
+    "$WORK_DIR/mesh-run/$MESH_BLOCKLIST"
+}
+
+printf '\n  mesh matches the cluster definition (no-op)\n'
+run_mesh_prune "$MESH_PRUNE" "$WORK_DIR/secrets-converged.json" "" "$WORK_DIR/wired.json"
+expect_exit "succeeds" 0 "$ENGINE_RC"
+expect_contains "says it has nothing to prune" "$ENGINE_OUT" "nothing to prune"
+expect_absent "reports no removals" "$ENGINE_OUT" "::nixcluster:removed::"
+expect_absent "does not touch the member that renames itself" "$ENGINE_OUT" "mesh-node-2"
+expect_absent "contacts nobody" "$WORK_DIR/mesh-calls" "ssh "
+expect_eq "leaves the blocklist exactly as it was" "$FP_ANCIENT" "$(blocklist_fingerprints)"
+
+printf '\n  a departed member is REVOKED, not merely forgotten\n'
+run_mesh_prune "$MESH_PRUNE" "$WORK_DIR/secrets-departed.json" "" "$WORK_DIR/wired.json"
+expect_exit "succeeds" 0 "$ENGINE_RC"
+expect_contains "takes the force path (the host is gone)" "$ENGINE_OUT" "force path"
+expect_contains "reports the removal" "$ENGINE_OUT" '"name":"old-node"'
+expect_contains "reports it as an action" "$ENGINE_OUT" '"action":"removed"'
+expect_contains "names the fingerprint it revoked" "$ENGINE_OUT" "$FP_OLD"
+expect_contains "blocklists the departed certificate" \
+  "$WORK_DIR/mesh-run/$MESH_BLOCKLIST" "$FP_OLD"
+expect_absent "does not stop nebula on an unreachable host" \
+  "$WORK_DIR/mesh-calls" "systemctl stop"
+# The whole point: the earlier revocation is still there. A blocklist rebuilt
+# from the current member list would have dropped it and un-revoked that host.
+expect_eq "keeps every earlier revocation" \
+  "$(printf '%s\n%s\n' "$FP_ANCIENT" "$FP_OLD" | sort | tr '\n' ' ' | sed 's/ $//')" \
+  "$(blocklist_fingerprints)"
+
+printf '\n  the blocklist survives the next converge (idempotent, still revoked)\n'
+# Same registry, but now carrying the blocklist the previous run produced: the
+# departed member is already revoked, so there is nothing left to do.
+cp "$WORK_DIR/mesh-run/$MESH_BLOCKLIST" "$WORK_DIR/blocklist-after.json"
+run_mesh_prune "$MESH_PRUNE" "$WORK_DIR/secrets-departed.json" "" "$WORK_DIR/blocklist-after.json"
+expect_exit "succeeds" 0 "$ENGINE_RC"
+expect_contains "says it has nothing to prune" "$ENGINE_OUT" "nothing to prune"
+expect_absent "reports no removals" "$ENGINE_OUT" "::nixcluster:removed::"
+expect_eq "the revocations are still both there" \
+  "$(printf '%s\n%s\n' "$FP_ANCIENT" "$FP_OLD" | sort | tr '\n' ' ' | sed 's/ $//')" \
+  "$(blocklist_fingerprints)"
+expect_eq "and are not duplicated" "2" \
+  "$(jq '.revoked | length' "$WORK_DIR/mesh-run/$MESH_BLOCKLIST")"
+
+printf '\n  a reachable departing host is also stopped\n'
+run_mesh_prune "$MESH_PRUNE" "$WORK_DIR/secrets-departed.json" "192.168.100.9" "$WORK_DIR/wired.json"
+expect_exit "succeeds" 0 "$ENGINE_RC"
+expect_contains "takes the graceful path" "$ENGINE_OUT" "host reachable"
+expect_contains "reaches it at the address in its own certificate" \
+  "$WORK_DIR/mesh-calls" "root@192.168.100.9"
+expect_contains "stops nebula on it" "$WORK_DIR/mesh-calls" "systemctl stop nebula@mesh.service"
+expect_contains "still revokes the certificate" \
+  "$WORK_DIR/mesh-run/$MESH_BLOCKLIST" "$FP_OLD"
+
+printf '\n  a blocklist the configuration does not read is reported\n'
+run_mesh_prune "$MESH_PRUNE" "$WORK_DIR/secrets-converged.json" "" ""
+expect_exit "succeeds" 0 "$ENGINE_RC"
+expect_contains "warns that the two files have drifted apart" "$ENGINE_OUT" \
+  "nebula.blocklistFile appears to point"
+expect_contains "names the fingerprint that is missing" "$ENGINE_OUT" "$FP_ANCIENT"
+
+printf '\n  without a blocklist file, nothing is removed\n'
+# Dropping a member from the host map is not revocation, so a prune that cannot
+# record one refuses instead of pretending.
+MESH_PRUNE_NO_BLOCKLIST="$(build_mesh_step mesh "")"
+run_mesh_prune "$MESH_PRUNE_NO_BLOCKLIST" "$WORK_DIR/secrets-departed.json" "" ""
+expect_exit "fails the step" 1 "$ENGINE_RC"
+expect_contains "refuses loudly" "$ENGINE_OUT" "REFUSING to remove old-node"
+expect_contains "says why it would be meaningless" "$ENGINE_OUT" \
+  "nebula.blocklistFile is not set"
+expect_contains "reports the member as failed" "$ENGINE_OUT" '"status":"Failed"'
+expect_no_file "writes no blocklist" "$WORK_DIR/mesh-run/$MESH_BLOCKLIST"
+expect_absent "stops nothing" "$WORK_DIR/mesh-calls" "systemctl stop"
+
+printf '\n  an empty desired set fails loudly and revokes nothing\n'
+# A cluster that still declares a mesh but has lost every mesh member: a broken
+# generated node file must not be able to revoke the whole mesh.
+MESH_PRUNE_EMPTY="$(build_mesh_step mesh-empty "$WORK_DIR/wired.json")"
+run_mesh_prune "$MESH_PRUNE_EMPTY" "$WORK_DIR/secrets-departed.json" "" ""
+expect_exit "fails the step" 1 "$ENGINE_RC"
+expect_contains "refuses loudly" "$ENGINE_OUT" "the desired member set is empty"
+expect_absent "removes nothing" "$ENGINE_OUT" "::nixcluster:removed::"
+expect_no_file "writes no blocklist" "$WORK_DIR/mesh-run/$MESH_BLOCKLIST"
+expect_absent "contacts nobody" "$WORK_DIR/mesh-calls" "ssh "
+
+printf '\n  gen-certs establishes the blocklist and one identity per member\n'
+# The other half of the loop: certificates are issued under the SAME canonical
+# registry name the prune step diffs, and the blocklist file exists (and is
+# therefore committable) before anything has to be revoked.
+MESH_GEN_CERTS="$(build_mesh_step mesh "$WORK_DIR/wired.json" nebula.gen-certs \
+  nixclusterctl-mesh-nebula-gen-certs)"
+export STUB_CALLS="$WORK_DIR/gen-calls"
+export STUB_SECRETS="$WORK_DIR/secrets-converged.json"
+: > "$STUB_CALLS"
+rm -rf "$WORK_DIR/gen-run"
+mkdir -p "$WORK_DIR/gen-run/secrets"
+: > "$WORK_DIR/gen-run/secrets/.sops.yaml"
+: > "$WORK_DIR/gen-run/secrets/mesh.age.key"
+ENGINE_OUT="$WORK_DIR/gen-out"
+set +e
+(cd "$WORK_DIR/gen-run" && "$MESH_GEN_CERTS") > "$ENGINE_OUT" 2>&1
+ENGINE_RC=$?
+set -e
+expect_exit "succeeds" 0 "$ENGINE_RC"
+expect_contains "issues a certificate under the canonical registry name" \
+  "$ENGINE_OUT" "[sign] mesh-node-2"
+expect_absent "and not under the member name" "$ENGINE_OUT" "[sign] node2"
+expect_eq "creates the blocklist the configuration will read" "0" \
+  "$(jq '.revoked | length' "$WORK_DIR/gen-run/$MESH_BLOCKLIST")"
+expect_contains "tells the operator to commit it" "$ENGINE_OUT" "Commit it"
+
+printf '\n  the blocklist reaches every surviving host\n'
+# Evaluation only: what the mesh definition puts in each member's nebula config.
+# Blocklisting is worthless if the list stops at the lighthouse, which is exactly
+# what upstream warns about — lighthouses do not distribute it.
+MESH_CONFIG="$WORK_DIR/mesh-config.json"
+"${NIX[@]}" eval --impure --json --expr "
+  import $REPO_ROOT/scripts/prune-stubs.nix {
+    repoRoot = \"$REPO_ROOT\";
+    blocklistFile = \"$WORK_DIR/wired-old.json\";
+    output = \"nebula-config\";
+  }" > "$MESH_CONFIG" 2>"$WORK_DIR/mesh-config-err" || true
+if [[ ! -s "$MESH_CONFIG" ]]; then
+  echo "could not evaluate the mesh nebula config:" >&2
+  cat "$WORK_DIR/mesh-config-err" >&2
+  exit 1
+fi
+expect_eq "the lighthouse blocklists the departed certificate" "$FP_OLD" \
+  "$(jq --raw-output '.node1.blocklist | join(" ")' "$MESH_CONFIG")"
+expect_eq "so does every other member" "$FP_OLD" \
+  "$(jq --raw-output '.node2.blocklist | join(" ")' "$MESH_CONFIG")"
+expect_eq "the departed host is out of the lighthouse host map" "" \
+  "$(jq --raw-output '[.node1.staticHostMap, .node2.staticHostMap]
+     | map(keys[]) | unique | map(select(. == "192.168.100.9")) | join(" ")' "$MESH_CONFIG")"
+expect_eq "a member that renames itself keeps one identity everywhere" \
+  "/run/secrets/nebula/mesh-node-2/crt" \
+  "$(jq --raw-output '.node2.cert' "$MESH_CONFIG")"
 
 printf '\n%d check(s) passed, %d failed\n' "$checks" "$failures"
 [[ "$failures" -eq 0 ]]
