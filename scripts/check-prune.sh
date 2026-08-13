@@ -465,6 +465,18 @@ expect_contains "warns that the two files have drifted apart" "$ENGINE_OUT" \
   "nebula.blocklistFile appears to point"
 expect_contains "names the fingerprint that is missing" "$ENGINE_OUT" "$FP_ANCIENT"
 
+printf '\n  a registry it cannot read is not an empty registry\n'
+# A certificate that will not parse must not silently shrink the registry: every
+# host still holding one would look like a departure and be revoked.
+jq '.nebula["old-node"].crt = "-----BEGIN NEBULA CERTIFICATE-----\nnot a certificate\n-----END NEBULA CERTIFICATE-----\n"' \
+  "$WORK_DIR/secrets-departed.json" > "$WORK_DIR/secrets-corrupt.json"
+run_mesh_prune "$MESH_PRUNE" "$WORK_DIR/secrets-corrupt.json" "" "$WORK_DIR/wired.json"
+expect_exit "gives up quietly" 0 "$ENGINE_RC"
+expect_contains "says it could not read the registry" "$ENGINE_OUT" \
+  "could not read the registry"
+expect_absent "removes nothing" "$ENGINE_OUT" "::nixcluster:removed::"
+expect_eq "revokes nothing" "$FP_ANCIENT" "$(blocklist_fingerprints)"
+
 printf '\n  without a blocklist file, nothing is removed\n'
 # Dropping a member from the host map is not revocation, so a prune that cannot
 # record one refuses instead of pretending.
