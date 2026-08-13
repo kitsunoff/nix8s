@@ -54,6 +54,6 @@ jobs:
 
       # Pruning is the only part of converge that deletes things, so its safety
       # rules are verified on every change: the engine's branches against an
-      # injected registry, and the real k3s step against stubbed kubectl/ssh.
+      # injected registry, and the real module steps against stubbed binaries.
       - name: Check prune logic
         run: ./scripts/check-prune.sh
