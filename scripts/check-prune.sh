@@ -2,7 +2,7 @@
 # check-prune.sh — verify the converge prune logic without a cluster.
 #
 # Pruning is the one part of converge that DELETES things, so its safety rules
-# have to be verifiable cheaply and often. Two layers:
+# have to be verifiable cheaply and often. Five layers:
 #
 #   Part A — the shared engine (lib/prune.nix) with the registry and the removal
 #            command injected, so every branch is reachable deterministically:
@@ -19,6 +19,15 @@
 #            certificate and can still reach peers directly. They also assert that
 #            the blocklist ACCUMULATES — a list rebuilt from the current members
 #            would silently restore every host revoked so far.
+#
+#   Part D — the REAL keepalived prune step against a stubbed VRRP segment. Its
+#            assertions are on the survivors' RUNNING config after the reload,
+#            never on the fact that a reload was issued: a reload that re-reads
+#            nothing returns 0 just as happily as one that works.
+#
+#   Part E — what the keepalived NixOS module renders, by evaluation: that the
+#            unit can be reloaded at all, and that the MASTER Part D verifies is
+#            the one the module elects.
 #
 # Usage: scripts/check-prune.sh
 # Exit status is non-zero on the first failed expectation.
@@ -553,6 +562,276 @@ expect_eq "the departed host is out of the lighthouse host map" "" \
 expect_eq "a member that renames itself keeps one identity everywhere" \
   "/run/secrets/nebula/mesh-node-2/crt" \
   "$(jq --raw-output '.node2.cert' "$MESH_CONFIG")"
+
+# ---------------------------------------------------------------------------
+# Part D — the real keepalived prune step against a stubbed VRRP segment.
+#
+# keepalived has no cluster database, so the module gives it one: a participation
+# ledger written by every render and emptied only here. The ssh stub models HOSTS
+# (see scripts/prune-stubs.nix): each address serves its own ledger and its own
+# running keepalived.conf, and a reload swaps the running config for whatever the
+# active generation would render — or, when there is nothing to swap in, for the
+# same bytes, which is the "reload that reloaded nothing" this step must catch.
+# ---------------------------------------------------------------------------
+printf '\n==> Part D: the keepalived prune step with a stubbed VRRP segment\n'
+
+build_keepalived() { # cluster -> prints the built step path
+  "${NIX[@]}" build --impure --no-link --print-out-paths \
+    --file "$REPO_ROOT/scripts/prune-stubs.nix" --argstr repoRoot "$REPO_ROOT" \
+    --argstr cluster "$1" --argstr step keepalived.prune 2>&1 | tail -n 1
+}
+
+KA_DIR="$WORK_DIR/ka"
+
+# ka_conf <path> <self> <state> <priority> [peer-ip...]
+# A running /run/keepalived/keepalived.conf. The manifest comment and the
+# vrrp_instance block carry the same values, exactly as the NixOS module renders
+# them, so an assertion on one is an assertion on the other.
+ka_conf() {
+  local path="$1" self="$2" state="$3" prio="$4" ip
+  shift 4
+  {
+    printf '# nixcluster:keepalived instance=web self=%s state=%s priority=%s\n' \
+      "$self" "$state" "$prio"
+    for ip in "$@"; do
+      printf '# nixcluster:keepalived instance=web peer=%s ip=%s\n' "peer@$ip" "$ip"
+    done
+    printf 'vrrp_instance web {\n  state %s\n  priority %s\n' "$state" "$prio"
+    printf '  unicast_peer {\n'
+    for ip in "$@"; do printf '    %s\n' "$ip"; done
+    printf '  }\n}\n'
+  } > "$path"
+}
+
+# ka_reset — the departure this part is about: `gone-1` (10.0.0.9) was the MASTER
+# of instance `web` and has left the cluster definition. Both survivors are still
+# running the config they came up with, which still lists it.
+ka_reset() {
+  rm -rf "$KA_DIR"
+  mkdir -p "$KA_DIR"
+  export STUB_CALLS="$WORK_DIR/ka-calls"
+  export STUB_REACHABLE="$WORK_DIR/ka-reachable"
+  export STUB_DIR="$KA_DIR"
+  : > "$STUB_CALLS"
+  printf '10.0.0.1\n10.0.0.2\n' > "$STUB_REACHABLE"
+  local ip
+  for ip in 10.0.0.1 10.0.0.2; do
+    printf 'web node1 10.0.0.1\nweb node2 10.0.0.2\nweb gone-1 10.0.0.9\n' \
+      > "$KA_DIR/$ip.ledger"
+  done
+  ka_conf "$KA_DIR/10.0.0.1.conf" node1 BACKUP 100 10.0.0.2 10.0.0.9
+  ka_conf "$KA_DIR/10.0.0.2.conf" node2 BACKUP 100 10.0.0.1 10.0.0.9
+}
+
+# ka_reload_renders — what the survivors' keepalived re-reads on the next reload:
+# the MASTER is gone, so the election promotes node1 and the peer list loses it.
+ka_reload_renders() {
+  ka_conf "$KA_DIR/10.0.0.1.conf.after" node1 MASTER 150 10.0.0.2
+  ka_conf "$KA_DIR/10.0.0.2.conf.after" node2 BACKUP 100 10.0.0.1
+}
+
+run_ka() { # exe
+  ENGINE_OUT="$WORK_DIR/ka-out"
+  set +e
+  "$1" > "$ENGINE_OUT" 2>&1
+  ENGINE_RC=$?
+  set -e
+}
+
+KA_PRUNE="$(build_keepalived vrrp)/bin/nixcluster-prune-keepalived"
+[[ -x "$KA_PRUNE" ]] || { echo "could not build the keepalived prune step: $KA_PRUNE" >&2; exit 1; }
+
+printf '\n  the peer list already matches the members (no-op)\n'
+# A settled cluster: the registry lists exactly the members, and the running
+# config on each of them lists exactly the other.
+ka_reset
+ka_reload_renders
+printf 'web node1 10.0.0.1\nweb node2 10.0.0.2\n' > "$KA_DIR/10.0.0.1.ledger"
+printf 'web node1 10.0.0.1\nweb node2 10.0.0.2\n' > "$KA_DIR/10.0.0.2.ledger"
+ka_conf "$KA_DIR/10.0.0.1.conf" node1 MASTER 150 10.0.0.2
+ka_conf "$KA_DIR/10.0.0.2.conf" node2 BACKUP 100 10.0.0.1
+run_ka "$KA_PRUNE"
+expect_exit "succeeds" 0 "$ENGINE_RC"
+expect_contains "says it has nothing to prune" "$ENGINE_OUT" "nothing to prune"
+expect_absent "reports no removals" "$ENGINE_OUT" "::nixcluster:removed::"
+expect_absent "reloads nobody" "$STUB_CALLS" "reload-or-restart"
+expect_absent "rewrites no ledger" "$STUB_CALLS" "sh -s"
+
+printf '\n  a departed member is dropped from the peer list and the survivors reload\n'
+ka_reset
+ka_reload_renders
+run_ka "$KA_PRUNE"
+expect_exit "succeeds" 0 "$ENGINE_RC"
+expect_contains "reloads the first survivor" "$STUB_CALLS" "root@10.0.0.1 systemctl reload-or-restart keepalived"
+expect_contains "reloads the second survivor" "$STUB_CALLS" "root@10.0.0.2 systemctl reload-or-restart keepalived"
+expect_contains "reports the removal" "$ENGINE_OUT" '"name":"gone-1"'
+expect_contains "reports it as an action" "$ENGINE_OUT" '"action":"removed"'
+expect_contains "reports it as applied" "$ENGINE_OUT" '"status":"Applied"'
+# The effect, not the call: the running config the daemon now holds.
+expect_absent "the running peer list no longer carries the departed address" \
+  "$KA_DIR/10.0.0.1.conf" "10.0.0.9"
+expect_absent "and the departed member is out of the registry" \
+  "$KA_DIR/10.0.0.1.ledger" "gone-1"
+expect_contains "while the surviving peer is kept" "$KA_DIR/10.0.0.1.conf" "10.0.0.2"
+
+printf '\n  the departed member was MASTER: a survivor takes the VIP over\n'
+expect_contains "says which survivor holds it" "$ENGINE_OUT" "instance web: node1 is MASTER and holds the VIP"
+expect_contains "and its running config agrees" "$KA_DIR/10.0.0.1.conf" "state MASTER"
+expect_contains "with the higher priority" "$KA_DIR/10.0.0.1.conf" "priority 150"
+expect_contains "the other survivor stays BACKUP" "$KA_DIR/10.0.0.2.conf" "state BACKUP"
+
+printf '\n  a reload that re-reads nothing is a failure, not a success\n'
+# Same run, except the survivors have nothing new to re-read: keepalived keeps
+# the peer list it started with. Asserting on the reload CALL would pass here.
+ka_reset
+run_ka "$KA_PRUNE"
+expect_exit "fails the step" 1 "$ENGINE_RC"
+expect_contains "issued the reload" "$STUB_CALLS" "systemctl reload-or-restart keepalived"
+expect_contains "and noticed it did not take effect" "$ENGINE_OUT" "the reload did not take effect"
+expect_contains "reports the removal as failed" "$ENGINE_OUT" '"status":"Failed"'
+
+printf '\n  a prune that would leave the VIP without a priority holder fails\n'
+ka_reset
+# The reload takes effect — the departed peer really is gone — but no survivor
+# comes back as MASTER, so nothing is configured to claim the address.
+ka_conf "$KA_DIR/10.0.0.1.conf.after" node1 BACKUP 100 10.0.0.2
+ka_conf "$KA_DIR/10.0.0.2.conf.after" node2 BACKUP 100 10.0.0.1
+run_ka "$KA_PRUNE"
+expect_exit "fails the step" 1 "$ENGINE_RC"
+expect_absent "the peer list was still rebuilt" "$KA_DIR/10.0.0.1.conf" "10.0.0.9"
+expect_contains "says the VIP has no priority holder" "$ENGINE_OUT" "no priority holder among the survivors"
+
+printf '\n  a departing host that still answers has its keepalived stopped\n'
+ka_reset
+ka_reload_renders
+printf '10.0.0.1\n10.0.0.2\n10.0.0.9\n' > "$STUB_REACHABLE"
+run_ka "$KA_PRUNE"
+expect_exit "succeeds" 0 "$ENGINE_RC"
+expect_contains "takes the graceful path" "$ENGINE_OUT" "host reachable"
+expect_contains "stops keepalived on the departing host" "$STUB_CALLS" "root@10.0.0.9 systemctl stop keepalived"
+expect_contains "says the VIP was released" "$ENGINE_OUT" "released the VIP"
+expect_contains "and still reconciles the survivors" "$STUB_CALLS" "root@10.0.0.1 systemctl reload-or-restart keepalived"
+
+printf '\n  a departing host that is gone still leaves the survivors reconciled\n'
+ka_reset
+ka_reload_renders
+run_ka "$KA_PRUNE"
+expect_exit "succeeds" 0 "$ENGINE_RC"
+expect_contains "takes the force path" "$ENGINE_OUT" "host unreachable"
+expect_absent "does not try to stop anything on it" "$STUB_CALLS" "systemctl stop keepalived"
+expect_absent "the survivors' peer list is rebuilt anyway" "$KA_DIR/10.0.0.2.conf" "10.0.0.9"
+expect_contains "and the removal is reported" "$ENGINE_OUT" '"name":"gone-1"'
+
+printf '\n  a registry nobody answers for is not an empty registry\n'
+ka_reset
+ka_reload_renders
+: > "$STUB_REACHABLE" # no survivor answers
+run_ka "$KA_PRUNE"
+expect_exit "gives up quietly" 0 "$ENGINE_RC"
+expect_contains "says the registry is unavailable" "$ENGINE_OUT" "unavailable, not empty"
+expect_absent "removes nothing" "$ENGINE_OUT" "::nixcluster:removed::"
+expect_absent "reloads nobody" "$STUB_CALLS" "reload-or-restart"
+
+printf '\n  a removal that would leave an instance with no eligible MASTER is refused\n'
+KA_ORPHAN="$(build_keepalived vrrp-orphan)/bin/nixcluster-prune-keepalived"
+ka_reset
+ka_reload_renders
+printf 'web node1 10.0.0.1\nweb node2 10.0.0.2\ndb gone-1 10.0.0.9\n' > "$KA_DIR/10.0.0.1.ledger"
+printf 'web node1 10.0.0.1\nweb node2 10.0.0.2\ndb gone-1 10.0.0.9\n' > "$KA_DIR/10.0.0.2.ledger"
+run_ka "$KA_ORPHAN"
+expect_exit "does not fail the run" 0 "$ENGINE_RC"
+expect_contains "refuses loudly" "$ENGINE_OUT" "REFUSING to prune"
+expect_contains "names the instance" "$ENGINE_OUT" "that can hold their virtual address: db"
+expect_contains "reports the refusal per member" "$ENGINE_OUT" '"status":"Failed"'
+expect_absent "reloads nobody" "$STUB_CALLS" "reload-or-restart"
+expect_absent "rewrites no config" "$STUB_CALLS" "sh -s"
+if [[ ! -s "$STUB_CALLS" ]]; then
+  ok "touches no host at all"
+else
+  fail "a refused prune still reached out: $(cat "$STUB_CALLS")"
+fi
+
+printf '\n  an empty desired set fails loudly and reloads nothing\n'
+KA_EMPTY="$(build_keepalived vrrp-empty)/bin/nixcluster-prune-keepalived"
+ka_reset
+ka_reload_renders
+run_ka "$KA_EMPTY"
+expect_exit "fails the step" 1 "$ENGINE_RC"
+expect_contains "refuses loudly" "$ENGINE_OUT" "the desired member set is empty"
+expect_contains "names the likely cause" "$ENGINE_OUT" "broken or truncated"
+expect_absent "reloads nobody" "$STUB_CALLS" "reload-or-restart"
+if [[ ! -s "$STUB_CALLS" ]]; then
+  ok "rewrites no config and touches no host"
+else
+  fail "an empty desired set still reached out: $(cat "$STUB_CALLS")"
+fi
+
+# ---------------------------------------------------------------------------
+# Part E — what the keepalived NixOS module actually renders.
+#
+# Part D proves the step reacts correctly to a reload that works and to one that
+# does not. This part proves the unit CAN reload at all (systemd refuses
+# `systemctl reload` outright on a unit with no ExecReload=), and that the MASTER
+# the step verifies is the one the module elects.
+# ---------------------------------------------------------------------------
+printf '\n==> Part E: what the keepalived NixOS module renders\n'
+
+# `nix eval --file` does not apply --argstr, so the harness is imported and
+# applied explicitly.
+ka_expr() { # cluster output member
+  printf 'import %s/scripts/prune-stubs.nix { repoRoot = "%s"; cluster = "%s"; output = "%s"; member = "%s"; }' \
+    "$REPO_ROOT" "$REPO_ROOT" "$1" "$2" "$3"
+}
+
+eval_keepalived() { # cluster output member -> writes to $EVAL_OUT
+  EVAL_OUT="$WORK_DIR/ka-eval"
+  "${NIX[@]}" eval --impure --raw --expr "$(ka_expr "$1" "$2" "$3")" \
+    > "$EVAL_OUT" 2>&1
+}
+
+# The `vrrp-master-departed` cluster declares nodes = [ gone-1 node1 node2 ] with
+# gone-1 no longer a member: the node the instance names FIRST is the one that
+# left. Electing on the declared list would leave node1 and node2 both BACKUP.
+printf '\n  the MASTER election skips a node that has left the member set\n'
+eval_keepalived vrrp-master-departed keepalived-preStart node1
+expect_contains "node1 is promoted to MASTER" "$EVAL_OUT" 'echo "  state MASTER"'
+expect_contains "with the higher priority" "$EVAL_OUT" 'echo "  priority 150"'
+expect_contains "and the manifest says the same" "$EVAL_OUT" \
+  'instance=web self=node1 state=MASTER priority=150'
+expect_absent "the departed node is not a unicast peer" "$EVAL_OUT" "peer=gone-1"
+
+printf '\n  and exactly one survivor is MASTER\n'
+eval_keepalived vrrp-master-departed keepalived-preStart node2
+expect_contains "node2 stays BACKUP" "$EVAL_OUT" 'echo "  state BACKUP"'
+expect_contains "with the lower priority" "$EVAL_OUT" 'echo "  priority 100"'
+expect_contains "peering with the elected MASTER" "$EVAL_OUT" 'echo "    10.0.0.1"'
+
+printf '\n  the render records the participation ledger the prune step reads\n'
+eval_keepalived vrrp keepalived-preStart node1
+expect_contains "declares the ledger path" "$EVAL_OUT" "/var/lib/nixcluster-keepalived/participants"
+expect_contains "records itself" "$EVAL_OUT" "ledger_add web node1 10.0.0.1"
+expect_contains "records its peer" "$EVAL_OUT" "ledger_add web node2 10.0.0.2"
+
+# Without ExecReload= systemd rejects `systemctl reload` with "Job type reload is
+# not applicable", and keepalived re-reads only the file it was given — which
+# ExecStartPre writes. So a reload has to be both halves, or the survivors keep
+# the peer list they started with while every command still returns 0.
+printf '\n  `systemctl reload` is a real reload: re-render, then SIGHUP\n'
+eval_keepalived vrrp keepalived-reload node1
+expect_contains "re-renders the config" "$EVAL_OUT" 'CONF=/run/keepalived/keepalived.conf'
+expect_contains "truncates and rewrites it" "$EVAL_OUT" ': > "$CONF"'
+expect_contains "refreshes the ledger too" "$EVAL_OUT" "ledger_add web node1 10.0.0.1"
+expect_contains "then signals keepalived" "$EVAL_OUT" 'kill -HUP "$MAINPID"'
+
+printf '\n  the converge plan takes members away only once they have settled\n'
+KA_DEPS="$WORK_DIR/ka-deps"
+"${NIX[@]}" eval --impure --json --expr "$(ka_expr vrrp step-deps node1)" \
+  > "$KA_DEPS" 2>&1
+expect_contains "prune waits for every member" "$KA_DEPS" \
+  '"keepalived.prune":["member-node1","member-node2"'
+expect_contains "and for the reconcile step" "$KA_DEPS" '"keepalived.reconcile"]'
+expect_contains "reconcile waits for every member" "$KA_DEPS" \
+  '"keepalived.reconcile":["member-node1","member-node2"]'
 
 printf '\n%d check(s) passed, %d failed\n' "$checks" "$failures"
 [[ "$failures" -eq 0 ]]
